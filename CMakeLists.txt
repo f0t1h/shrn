@@ -1,8 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 project(shrn VERSION 0.2.0 LANGUAGES CXX)
 
-option(SHRN_USE_ZLIB "Link zlib for gzip-aware helpers when found" ON)
-
 include(GNUInstallDirs)
 
 add_library(shrn INTERFACE)
@@ -15,18 +13,6 @@ target_include_directories(shrn INTERFACE
 find_package(Threads REQUIRED)
 target_link_libraries(shrn INTERFACE Threads::Threads)
 
-set(SHRN_WITH_ZLIB OFF)
-if(SHRN_USE_ZLIB)
-    find_package(ZLIB)
-    if(ZLIB_FOUND)
-        target_link_libraries(shrn INTERFACE ZLIB::ZLIB)
-        set(SHRN_WITH_ZLIB ON)
-    endif()
-endif()
-if(NOT SHRN_WITH_ZLIB)
-    # The header auto-detects <zlib.h>; make sure it cannot pick it up unlinked.
-    target_compile_definitions(shrn INTERFACE SHRN_NO_ZLIB=1)
-endif()
 
 # Install / package config.
 include(CMakePackageConfigHelpers)
@@ -49,21 +35,13 @@ install(FILES
     ${CMAKE_CURRENT_BINARY_DIR}/shrnConfigVersion.cmake
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/shrn)
 
-# Test both expected implementations when building shrn directly.
+# Tests when building shrn directly.
 if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
     include(CTest)
     if(BUILD_TESTING)
-        foreach(variant IN ITEMS native fallback)
-            set(target shrn_tests_${variant})
-            add_executable(${target} tests/test_shrn.cpp)
-            target_link_libraries(${target} PRIVATE shrn::shrn)
-            target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
-            if(variant STREQUAL fallback)
-                target_compile_definitions(${target} PRIVATE SHRN_FORCE_FALLBACK_EXPECTED=1)
-            elseif(cxx_std_23 IN_LIST CMAKE_CXX_COMPILE_FEATURES)
-                target_compile_features(${target} PRIVATE cxx_std_23)
-            endif()
-            add_test(NAME ${target} COMMAND ${target})
-        endforeach()
+        add_executable(shrn_tests tests/test_shrn.cpp)
+        target_link_libraries(shrn_tests PRIVATE shrn::shrn)
+        target_compile_options(shrn_tests PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME shrn_tests COMMAND shrn_tests)
     endif()
 endif()

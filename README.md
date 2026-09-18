@@ -29,23 +29,25 @@ the `Outcome` and inspect `ok()`, `detail()`, and `stderr_output()` instead.
 
 ## Results
 
-Functions such as `read_file` and `run` return `shrn::result<T>`, an
-`expected<T, std::error_code>`. Check the result before dereferencing it:
-`if (!r)` indicates an error; `r.error().message()` describes it. Calling
-`value()` on an error throws `shrn::bad_expected_access<std::error_code>`.
-
-`shrn::expected` uses `std::expected` when available, otherwise the fallback
-implementation in the header. The fallback supports `value`, `error`, `value_or`,
-`and_then`, `transform`, `or_else`, `transform_error`, and `expected<void, E>`.
-Define `SHRN_FORCE_FALLBACK_EXPECTED=1` to select it explicitly.
+Failures are error strings carried by the value, not a separate result type.
+`run(args)` returns a `RunResult` directly: `launched()` reports whether the
+child started (`error` holds the OS failure text otherwise), `success()`
+whether it exited with code 0, and `summary()` a human-readable description.
+`spawn()` returns a `Process`; a failed launch yields a `Process` whose
+`error()` is nonempty and which owns no child.
 
 These functions do not print diagnostics or exit. `Outcome::or_die_if` handles
 reporting; child programs and user callbacks control their own output.
-Allocation failures and exceptions from callbacks are not converted to error codes.
+
+No shrn function throws. Allocation failure during stderr capture and
+thread-creation failure are reported through the same error strings as every
+other failure. Exceptions from `call()` callbacks propagate to the caller;
+that is the callback throwing, not shrn. Functions returning `std::string`
+still allocate; under OOM the allocation itself is the failure.
 
 ## Processes
 
-`spawn(args, options)` starts a child and returns `result<Process>` after exec
+`spawn(args, options)` starts a child and returns `Process` after exec
 succeeds. `run(args, options)` is the synchronous version: spawn, then wait.
 Both use `fork` and `execvp`, search PATH, and inherit the
 environment. Pass each argument as a separate string. The argument list is not
@@ -61,20 +63,20 @@ for display, not execution.
 | `stdout_file` | Create or truncate this file; overrides `inherit_stdout`. Relative paths use the caller's directory, not `workdir`. |
 | `on_spawn` | Callback receiving the stage name and formatted command before launch. Uses `default_spawn_hook()` when unset. |
 
-The error side of `result<RunResult>` reports operating-system failures, including
-launch errors (`ENOENT` for a missing binary, bad `workdir`, pipe/fork errors)
-and failures while reading or waiting. Launch errors are detected via a
+Launch errors (`error()` on the `Process`, e.g. "No such file or directory"
+for a missing binary, bad `workdir`, pipe/fork failures) are detected via a
 `CLOEXEC` status pipe, not reported as exit code 127. A child that ran and
-failed is a value with `!success()`; `summary()` describes its exit code or signal.
+failed has `!success()`; `summary()` describes its exit code or signal.
 
 `Process` is move-only and owns its direct child:
 
 | Method | Behavior |
 |---|---|
-| `running()` | Nonblocking `result<bool>` status query. |
-| `wait()` | Wait indefinitely and return a reference to the cached `result<RunResult>`. |
-| `wait_for(duration)` | Return `result<wait_status>`: `ready` or `timeout`. Expiry neither kills nor fails the child. |
-| `terminate()` | SIGKILL and reap the direct child, returning `result<void>`. |
+| `running()` | Nonblocking status query. |
+| `wait()` | Wait indefinitely and return a reference to the cached `RunResult`. |
+| `wait_for(duration)` | Return `wait_status`: `ready` or `timeout`. Expiry neither kills nor fails the child. |
+| `terminate()` | SIGKILL and reap the direct child; kill failures land in `wait()`'s error. |
+| `error()` | The launch-failure text; empty when the child started. |
 
 Durations are milliseconds measured from the wait call, not launch. A zero or
 negative duration polls once. No background timer monitors the child.
@@ -99,8 +101,8 @@ prefixes error details (for example, `"minimap2: missing: out.paf"`).
 name (or the last command when the stage is anonymous); `or_die_if(cond, name)`
 overrides it.
 
-`expect_file(path)` requires a readable regular file. Add `Expect::NON_EMPTY`
-or `Expect::GZIPPED` (combinable with `|`), or pass a predicate and a label:
+`expect_file(path)` requires a readable regular file. Add `Expect::NON_EMPTY`,
+or pass a predicate and a label:
 `expect_file(path, predicate, "FASTQ")`. The predicate receives `const std::filesystem::path&`
 and returns whether the file is acceptable.
 
@@ -179,37 +181,20 @@ stored text; they do not mark the stage as failed.
 
 ## Files
 
-- `file_readable`, `file_non_empty`, and `file_is_gzipped` return booleans.
-  Gzip detection checks magic bytes, not the filename extension.
-- `read_file` returns raw bytes as a string; it does not decompress gzip.
-- `file_first_byte` and `line_count` read plain or gzip data. `line_count`
-  counts newline bytes, so an unterminated last line is not counted.
-- `ensure_directory` creates missing parent directories. `remove_if_exists`
-  succeeds if the path is absent. `force_symlink` removes the destination before
-  creating the link; a creation error does not restore the old destination.
-- `concat_files(inputs, output, mode)` copies bytes in `raw` mode or decompresses
-  gzip in `decompress` mode. It truncates the output first and can leave partial
-  output on error. The output must not refer to an input file.
+- `file_readable` and `file_non_empty` return booleans.
+- `ensure_directory` creates missing parent directories.
 
 ## Temporary files
 
 `make_temp_file` and `make_temp_dir` create paths in `$TMPDIR`, or `/tmp` when
-unset or empty. Their `_in` variants take a destination directory. The caller is
-responsible for removing the returned paths.
+unset or empty. Their `_in` variants take a destination directory. A failed
+creation returns an empty path; the caller is responsible for removing created
+paths.
 
-`TempFile::create` and `TempDir::create` return move-only owners. Destruction or
+`TempFile::create` and `TempDir::create` return move-only owners; a failed
+creation yields an empty owner (test with `operator bool`). Destruction or
 `reset()` removes the file or directory tree; cleanup errors are ignored.
 `release()` returns the path and disables automatic removal.
-
-## Gzip support
-
-The header detects `<zlib.h>` and sets `SHRN_HAS_ZLIB` to `1` or `0`. When
-including the header directly, link zlib or define `SHRN_NO_ZLIB=1`.
-The CMake target handles this, including when `SHRN_USE_ZLIB=OFF`.
-
-Without zlib, magic-byte detection and raw file copying are available.
-Operations that require decompression return `shrn::errc::zlib_unavailable`;
-plain inputs to `concat_files(..., concat_mode::decompress)` are copied unchanged.
 
 ## Integration
 
@@ -226,8 +211,7 @@ target_link_libraries(your_target PRIVATE shrn::shrn)
 
 Installed package: `find_package(shrn CONFIG REQUIRED)` then link `shrn::shrn`.
 Or copy `include/shrn.hpp`, enable thread support (`-pthread` with GCC/Clang on
-Linux), and link zlib yourself (or define `SHRN_NO_ZLIB=1`). The CMake target
-carries both dependencies.
+Linux). The CMake target carries the Threads dependency.
 
 ## Tests
 
@@ -235,12 +219,11 @@ carries both dependencies.
 cmake -S . -B build && cmake --build build && ctest --test-dir build
 ```
 
-Two binaries: `shrn_tests_native` uses `std::expected` when available (C++23
-when supported); `shrn_tests_fallback` uses C++20 and `SHRN_FORCE_FALLBACK_EXPECTED`.
+One binary, `shrn_tests`, built with `-Wall -Wextra -Wpedantic`.
 
-GitHub Actions runs both binaries on Ubuntu 24.04 with GCC 14 and Clang 18,
-each with zlib enabled and disabled. Each job also installs to a custom header
-directory, then builds and runs a separate `find_package` consumer. CI runs on
+GitHub Actions runs the test binary on Ubuntu 24.04 with GCC 14 and Clang 18.
+Each job also installs to a custom header directory, then builds and runs a
+separate `find_package` consumer. CI runs on
 pushes, pull requests, and manual dispatch. Other POSIX platforms are not covered
 by this workflow.
 

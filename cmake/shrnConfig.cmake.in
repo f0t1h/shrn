@@ -2,10 +2,6 @@
 
 include(CMakeFindDependencyMacro)
 find_dependency(Threads)
-set(SHRN_WITH_ZLIB @SHRN_WITH_ZLIB@)
-if(SHRN_WITH_ZLIB)
-    find_dependency(ZLIB)
-endif()
 
 include("${CMAKE_CURRENT_LIST_DIR}/shrnTargets.cmake")
 check_required_components(shrn)

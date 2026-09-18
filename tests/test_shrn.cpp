@@ -1,4 +1,4 @@
-// Tests for std::expected and the fallback implementation.
+// Tests for shrn: process execution, temp files, and staged commands.
 
 #include <shrn.hpp>
 
@@ -6,8 +6,7 @@
 #include <cstdio>
 #include <fstream>
 #include <memory>
-#include <stdexcept>
-#include <string>
+#include <optional>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -30,13 +29,12 @@ static void write_file(const fs::path& p, const std::string& content) {
     out << content;
 }
 
-#if SHRN_HAS_ZLIB
-static void write_gz(const fs::path& p, const std::string& content) {
-    gzFile gz = gzopen(p.c_str(), "wb");
-    gzwrite(gz, content.data(), static_cast<unsigned>(content.size()));
-    gzclose(gz);
+/// Local slurp helper (shrn no longer ships read_file).
+static std::string slurp(const fs::path& p) {
+    std::ifstream in(p, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
 }
-#endif
+
 
 // Run this binary with --helper=<mode> [arg] to test child-process behavior
 // without depending on an external script.
@@ -163,13 +161,14 @@ static int helper_main(const std::string& mode, const char* arg, const char* arg
         shrn::RunOptions o;
         o.stdout_file = dir / "closed_stdio.out";  // forces a dup2 onto fd 1
         auto r = shrn::run({g_self_exe.string(), "--helper=emit"}, o);
-        if (!r) return 11;
-        if (r->exit_code != 7) return 12;
-        if (r->stderr_output != "ERR\n") return 13;
-        if (shrn::read_file(*o.stdout_file).value_or(std::string()) != "OUT\n") return 14;
+        if (!r.launched()) return 11;
+        if (r.exit_code != 7) return 12;
+        if (r.stderr_output != "ERR\n") return 13;
+        if (slurp(*o.stdout_file) != "OUT\n") return 14;
         // Launch errors must reach the status pipe, not the redirected stdout file.
         auto bad = shrn::run({"shrn-definitely-not-a-command"}, o);
-        if (bad || bad.error() != std::errc::no_such_file_or_directory) return 15;
+        if (bad.launched() ||
+            bad.error.find("No such file or directory") == std::string::npos) return 15;
         return 0;
     }
     return 99;
@@ -188,9 +187,9 @@ template <class Pred> static bool wait_until(Pred pred, std::chrono::millisecond
 // Wait for the start marker of a pid-sleep-touch helper, then read its pid.
 static std::optional<pid_t> child_pid(const std::string& base) {
     if (!wait_until([&] { return fs::exists(base + ".pid"); })) return std::nullopt;
-    auto text = shrn::read_file(base + ".pid");
-    if (!text || text->empty()) return std::nullopt;
-    return static_cast<pid_t>(std::strtol(text->c_str(), nullptr, 10));
+    auto text = slurp(base + ".pid");
+    if (text.empty()) return std::nullopt;
+    return static_cast<pid_t>(std::strtol(text.c_str(), nullptr, 10));
 }
 
 static bool pid_gone(pid_t pid) { return ::kill(pid, 0) == -1 && errno == ESRCH; }
@@ -215,220 +214,6 @@ static void force_kill(pid_t pid) {
     }
 }
 
-// Constructors throw once when armed; assignment does not throw.
-// Used to check that failed construction preserves the previous expected state.
-struct Throwy {
-    static bool armed;
-    int code = 0;
-
-    Throwy() = default;
-    explicit Throwy(int c) : code(c) {}
-    Throwy(const Throwy& o) : code(o.code) { boom(); }
-    Throwy(Throwy&& o) : code(o.code) { boom(); }
-    Throwy& operator=(const Throwy& o) {
-        code = o.code;
-        return *this;
-    }
-    Throwy& operator=(Throwy&& o) {
-        code = o.code;
-        return *this;
-    }
-
-    static void boom() {
-        if (armed) {
-            armed = false;
-            throw std::runtime_error("Throwy");
-        }
-    }
-};
-bool Throwy::armed = false;
-
-// expected
-static void test_expected() {
-    std::fprintf(stderr, "expected (%s)\n", SHRN_HAS_STD_EXPECTED ? "std" : "fallback");
-
-    shrn::result<int> ok = 3;
-    shrn::result<int> bad = shrn::unexpected(std::make_error_code(std::errc::io_error));
-    CHECK(ok && *ok == 3, "value accessible");
-    CHECK(!bad && bad.error() == std::errc::io_error, "error accessible");
-    CHECK(bad.value_or(7) == 7 && ok.value_or(7) == 3, "value_or");
-
-    bool threw = false;
-    try {
-        (void) bad.value();
-    } catch (const shrn::bad_expected_access<std::error_code>& e) {
-        threw = e.error() == std::errc::io_error;
-    }
-    CHECK(threw, "value() on error throws bad_expected_access carrying the error");
-
-    auto doubled = ok.transform([](int v) { return v * 2; });
-    CHECK(doubled && *doubled == 6, "transform maps value");
-    auto still_bad = bad.transform([](int v) { return v * 2; });
-    CHECK(!still_bad && still_bad.error() == std::errc::io_error, "transform propagates error");
-
-    auto chained = ok.and_then([](int v) -> shrn::result<std::string> { return std::to_string(v); });
-    CHECK(chained && *chained == "3", "and_then chains");
-    auto failed_chain = ok.and_then([](int) -> shrn::result<std::string> {
-        return shrn::unexpected(std::make_error_code(std::errc::invalid_argument));
-    });
-    CHECK(!failed_chain && failed_chain.error() == std::errc::invalid_argument, "and_then can fail");
-
-    auto recovered = bad.or_else([](std::error_code) -> shrn::result<int> { return 42; });
-    CHECK(recovered && *recovered == 42, "or_else recovers");
-
-    auto remapped = bad.transform_error([](std::error_code) { return 99; });
-    CHECK(!remapped && remapped.error() == 99, "transform_error changes error type");
-
-    shrn::result<void> vok;
-    shrn::result<void> vbad = shrn::unexpected(std::make_error_code(std::errc::permission_denied));
-    CHECK(vok.has_value() && !vbad.has_value(), "void expected states");
-    auto after = vok.and_then([] { return shrn::result<int>(5); });
-    CHECK(after && *after == 5, "void and_then");
-    auto after_bad = vbad.and_then([] { return shrn::result<int>(5); });
-    CHECK(!after_bad && after_bad.error() == std::errc::permission_denied, "void and_then propagates");
-
-    CHECK(ok == 3, "compare with value");
-    CHECK(bad == shrn::unexpected(std::make_error_code(std::errc::io_error)), "compare with unexpected");
-    CHECK(ok != bad, "ok != bad");
-
-    shrn::result<std::string> s = std::string("abc");
-    std::string moved = std::move(s).value();
-    CHECK(moved == "abc", "rvalue value()");
-
-    // Failed construction must preserve the previous value or error.
-    auto two = shrn::unexpected(Throwy(2));
-
-    shrn::expected<int, Throwy> same(shrn::unexpect, 1);
-    Throwy::armed = true;
-    bool same_state_ok = false;
-    try {
-        same = two;  // error -> error must assign, not destroy + reconstruct
-        same_state_ok = true;
-    } catch (const std::runtime_error&) {
-    }
-    Throwy::armed = false;
-    CHECK(same_state_ok && !same.has_value() && same.error().code == 2, "same-state assignment assigns in place");
-
-    shrn::expected<int, Throwy> keep_value(5);
-    Throwy::armed = true;
-    bool threw_to_error = false;
-    try {
-        keep_value = two;
-    } catch (const std::runtime_error&) {
-        threw_to_error = true;
-    }
-    Throwy::armed = false;
-    CHECK(threw_to_error && keep_value.has_value() && *keep_value == 5,
-          "failed value -> error assignment keeps the old value");
-
-    shrn::expected<Throwy, int> keep_error(shrn::unexpect, 7);
-    Throwy three(3);
-    Throwy::armed = true;
-    bool threw_to_value = false;
-    try {
-        keep_error = three;
-    } catch (const std::runtime_error&) {
-        threw_to_value = true;
-    }
-    Throwy::armed = false;
-    CHECK(threw_to_value && !keep_error.has_value() && keep_error.error() == 7,
-          "failed error -> value assignment keeps the old error");
-
-    shrn::expected<void, Throwy> keep_void;
-    Throwy::armed = true;
-    bool threw_void = false;
-    try {
-        keep_void = two;
-    } catch (const std::runtime_error&) {
-        threw_void = true;
-    }
-    Throwy::armed = false;
-    CHECK(threw_void && keep_void.has_value(), "failed void assignment stays in the value state");
-
-    shrn::expected<void, Throwy> void_error(shrn::unexpect, 1);
-    Throwy::armed = true;
-    try {
-        void_error = two;
-    } catch (const std::runtime_error&) {
-    }
-    Throwy::armed = false;
-    CHECK(!void_error && void_error.error().code == 2,
-          "void error assignment does not discard the error through reconstruction");
-
-    shrn::expected<int, Throwy> copy_source(shrn::unexpect, 9);
-    Throwy::armed = true;
-    bool copy_threw = false;
-    try {
-        keep_value = copy_source;
-    } catch (const std::runtime_error&) {
-        copy_threw = true;
-    }
-    Throwy::armed = false;
-    CHECK(copy_threw && keep_value && *keep_value == 5,
-          "failed expected copy assignment preserves the old value");
-
-    shrn::expected<int, Throwy> sa(5);
-    shrn::expected<int, Throwy> sb(shrn::unexpect, 2);
-    Throwy::armed = true;
-    bool threw_swap = false;
-    try {
-        sa.swap(sb);
-    } catch (const std::runtime_error&) {
-        threw_swap = true;
-    }
-    Throwy::armed = false;
-    CHECK(threw_swap && sa.has_value() && *sa == 5 && !sb.has_value() && sb.error().code == 2,
-          "failed cross-state swap leaves both sides unchanged");
-    sa.swap(sb);
-    CHECK(!sa.has_value() && sa.error().code == 2 && sb.has_value() && *sb == 5, "cross-state swap exchanges states");
-
-    shrn::expected<int, int> nothrow_value(3), nothrow_error(shrn::unexpect, 4);
-    nothrow_value.swap(nothrow_error);
-    CHECK(!nothrow_value && nothrow_value.error() == 4 && nothrow_error && *nothrow_error == 3,
-          "nothrow swap exchanges value and error states");
-
-    // Check mutable lvalue and const rvalue overloads.
-    shrn::result<int> lv = 4;
-    auto lv_t = lv.transform([](int& v) { v += 1; return v; });
-    CHECK(lv_t && *lv_t == 5 && *lv == 5, "transform on a mutable lvalue passes T&");
-    auto lv_a = lv.and_then([](int& v) -> shrn::result<int> {
-        v *= 2;
-        return v;
-    });
-    CHECK(lv_a && *lv_a == 10 && *lv == 10, "and_then on a mutable lvalue passes T&");
-
-    shrn::result<int> lv_bad = shrn::unexpected(std::make_error_code(std::errc::io_error));
-    auto lv_te = lv_bad.transform_error([](std::error_code& e) {
-        e.clear();
-        return 5;
-    });
-    CHECK(!lv_te && lv_te.error() == 5 && !lv_bad.error(), "transform_error on a mutable lvalue passes E&");
-    auto lv_oe = lv_bad.or_else([](std::error_code& e) -> shrn::result<int> {
-        e = std::make_error_code(std::errc::invalid_argument);
-        return 1;
-    });
-    CHECK(lv_oe && *lv_oe == 1 && lv_bad.error() == std::errc::invalid_argument,
-          "or_else on a mutable lvalue passes E&");
-
-    const shrn::result<std::string> cs = std::string("xy");
-    auto cs_t = std::move(cs).transform([](const std::string&& v) { return v.size(); });
-    CHECK(cs_t && *cs_t == 2, "const rvalue transform passes const T&&");
-    CHECK(std::move(cs).value() == "xy", "const rvalue value()");
-    const shrn::result<int> cs_bad = shrn::unexpected(std::make_error_code(std::errc::io_error));
-    auto cs_oe = std::move(cs_bad).or_else(
-        [](const std::error_code&& e) -> shrn::result<int> { return e == std::errc::io_error ? 1 : 0; });
-    CHECK(cs_oe && *cs_oe == 1, "const rvalue or_else passes const E&&");
-
-    const shrn::result<void> cv{};
-    auto cv_t = std::move(cv).transform([] { return 8; });
-    CHECK(cv_t && *cv_t == 8, "const rvalue void transform");
-    shrn::result<void> mv = shrn::unexpected(std::make_error_code(std::errc::io_error));
-    auto mv_oe = mv.or_else([](std::error_code& e) -> shrn::result<void> {
-        e = std::make_error_code(std::errc::invalid_argument);
-        return {};
-    });
-    CHECK(mv_oe.has_value() && mv.error() == std::errc::invalid_argument, "void or_else on a mutable lvalue passes E&");
-}
 
 // files
 static void test_files(const fs::path& dir) {
@@ -436,101 +221,19 @@ static void test_files(const fs::path& dir) {
 
     auto missing = dir / "missing.txt";
     CHECK(!shrn::file_readable(missing), "missing not readable");
-    auto r = shrn::read_file(missing);
-    CHECK(!r && r.error() == std::errc::no_such_file_or_directory, "read_file missing -> ENOENT");
 
     auto text = dir / "text.txt";
     write_file(text, "a\nb\nc");
     CHECK(shrn::file_readable(text) && shrn::file_non_empty(text), "readable + non-empty");
-    CHECK(shrn::read_file(text).value() == "a\nb\nc", "read_file content");
-    CHECK(shrn::line_count(text).value() == 2, "line_count counts newlines only (no trailing)");
-    CHECK(shrn::file_first_byte(text).value() == 'a', "first_byte plain");
-    CHECK(!shrn::file_is_gzipped(text), "text not gzipped");
-
-#if defined(__linux__)
-    if (fs::exists("/proc/self/status")) {
-        auto status = shrn::read_file("/proc/self/status");
-        CHECK(status && status->find("Pid:\t" + std::to_string(::getpid()) + "\n") != std::string::npos,
-              "read_file reads virtual files whose reported size is zero");
-    }
-#endif
 
     auto empty = dir / "empty.txt";
     write_file(empty, "");
     CHECK(shrn::file_readable(empty) && !shrn::file_non_empty(empty), "empty readable but not non-empty");
-    auto fb = shrn::file_first_byte(empty);
-    CHECK(!fb && fb.error() == shrn::errc::empty_file, "first_byte empty -> errc::empty_file");
-    CHECK(shrn::line_count(empty).value() == 0, "line_count empty");
-
-    auto one = dir / "one.bin";
-    write_file(one, "\x1f");
-    CHECK(!shrn::file_is_gzipped(one), "1-byte file with half magic is not gzipped");
-
-    auto longline = dir / "long.txt";
-    write_file(longline, std::string(70000, 'x') + "\n" + std::string(70000, 'y') + "\n");
-    CHECK(shrn::line_count(longline).value() == 2, "line_count with lines longer than any buffer");
-    CHECK(shrn::read_file(longline).value() == std::string(70000, 'x') + "\n" + std::string(70000, 'y') + "\n",
-          "read_file preserves contents across buffer boundaries");
-
-    CHECK(shrn::line_count(missing).has_value() == false, "line_count missing is an error");
 
     auto sub = dir / "a" / "b" / "c";
-    CHECK(shrn::ensure_directory(sub).has_value() && fs::is_directory(sub), "ensure_directory creates parents");
-    CHECK(shrn::ensure_directory(sub).has_value(), "ensure_directory idempotent");
-    auto as_file = shrn::ensure_directory(text);
-    CHECK(!as_file, "ensure_directory over a file fails");
-
-    CHECK(shrn::remove_if_exists(missing).has_value(), "remove_if_exists missing is ok");
-    CHECK(shrn::remove_if_exists(one).has_value() && !fs::exists(one), "remove_if_exists removes");
-
-    auto link = dir / "link";
-    CHECK(shrn::force_symlink(text, link).has_value() && fs::is_symlink(link), "force_symlink creates");
-    CHECK(shrn::force_symlink(longline, link).has_value() && fs::read_symlink(link) == longline,
-          "force_symlink replaces existing link");
-
-    auto cat = dir / "cat.txt";
-    CHECK(shrn::concat_files({text, longline}, cat).has_value(), "concat raw ok");
-    CHECK(shrn::read_file(cat).value() == "a\nb\nc" + shrn::read_file(longline).value(), "concat raw bytes");
-    auto cat_bad = shrn::concat_files({text, missing}, cat);
-    CHECK(!cat_bad && cat_bad.error() == std::errc::no_such_file_or_directory, "concat missing input fails");
-
-    auto plain_cat = shrn::concat_files({text, empty, text}, cat, shrn::concat_mode::decompress);
-    CHECK(plain_cat && shrn::read_file(cat).value() == "a\nb\nca\nb\nc",
-          "decompress mode passes plain and empty inputs through with or without zlib");
-
-#if SHRN_HAS_ZLIB
-    auto gz = dir / "data.gz";
-    write_gz(gz, "line1\nline2\n" + std::string(70000, 'z') + "\n");
-    CHECK(shrn::file_is_gzipped(gz), "gz detected by magic");
-    CHECK(shrn::line_count(gz).value() == 3, "line_count inflates gzip (long line)");
-    CHECK(shrn::file_first_byte(gz).value() == 'l', "first_byte inflates gzip");
-
-    auto gz_misnamed = dir / "misnamed.txt";
-    fs::copy_file(gz, gz_misnamed);
-    CHECK(shrn::line_count(gz_misnamed).value() == 3, "gzip detected regardless of extension");
-
-    auto gz_empty = dir / "empty.gz";
-    write_gz(gz_empty, "");
-    auto fbz = shrn::file_first_byte(gz_empty);
-    CHECK(!fbz && fbz.error() == shrn::errc::empty_file, "first_byte empty gz -> errc::empty_file");
-
-    auto plain_out = dir / "inflated.txt";
-    CHECK(shrn::concat_files({gz, text}, plain_out, shrn::concat_mode::decompress).has_value(), "concat decompress ok");
-    CHECK(shrn::read_file(plain_out).value() == "line1\nline2\n" + std::string(70000, 'z') + "\na\nb\nc",
-          "concat decompress inflates gz and passes plain through");
-
-    auto multi = dir / "multi.gz";
-    CHECK(shrn::concat_files({gz, gz}, multi).has_value(), "concat raw gz members");
-    CHECK(shrn::line_count(multi).value() == 6, "raw-concatenated gz is a valid multi-member stream");
-#else
-    auto gz = dir / "fake.gz";
-    write_file(gz, "\x1f\x8b\x08rest");
-    auto lc = shrn::line_count(gz);
-    CHECK(!lc && lc.error() == shrn::errc::zlib_unavailable, "gzip without zlib -> zlib_unavailable");
-    auto cat_gz = shrn::concat_files({gz}, cat, shrn::concat_mode::decompress);
-    CHECK(!cat_gz && cat_gz.error() == shrn::errc::zlib_unavailable,
-          "decompress mode rejects gzip input without zlib");
-#endif
+    CHECK(shrn::ensure_directory(sub) && fs::is_directory(sub), "ensure_directory creates parents");
+    CHECK(shrn::ensure_directory(sub), "ensure_directory idempotent");
+    CHECK(!shrn::ensure_directory(text), "ensure_directory over a file fails");
 }
 
 // temp
@@ -539,22 +242,22 @@ static void test_temp(const fs::path& dir) {
 
     auto a = shrn::make_temp_file_in(dir, "t_", ".fq");
     auto b = shrn::make_temp_file_in(dir, "t_", ".fq");
-    CHECK(a && b && *a != *b, "temp files unique");
-    CHECK(a->extension() == ".fq" && a->filename().string().rfind("t_", 0) == 0, "prefix/suffix honored");
-    CHECK(fs::exists(*a) && fs::file_size(*a) == 0, "temp file created empty");
+    CHECK(!a.empty() && !b.empty() && a != b, "temp files unique");
+    CHECK(a.extension() == ".fq" && a.filename().string().rfind("t_", 0) == 0, "prefix/suffix honored");
+    CHECK(fs::exists(a) && fs::file_size(a) == 0, "temp file created empty");
 
     auto bad = shrn::make_temp_file_in(dir / "nope", "t_");
-    CHECK(!bad && bad.error() == std::errc::no_such_file_or_directory, "temp in missing dir fails");
+    CHECK(bad.empty(), "temp in missing dir fails");
 
     fs::path kept;
     fs::path removed;
     {
         auto tf = shrn::TempFile::create_in(dir, ".tmp");
-        CHECK(tf.has_value(), "TempFile created");
-        removed = tf->path();
+        CHECK(tf, "TempFile created");
+        removed = tf.path();
         auto tf2 = shrn::TempFile::create_in(dir);
-        kept = tf2->release();
-        CHECK(!*tf2, "released TempFile is empty");
+        kept = tf2.release();
+        CHECK(!tf2, "released TempFile is empty");
     }
     CHECK(!fs::exists(removed), "TempFile removed on scope exit");
     CHECK(fs::exists(kept), "released file kept");
@@ -562,9 +265,9 @@ static void test_temp(const fs::path& dir) {
     fs::path tree;
     {
         auto td = shrn::TempDir::create_in(dir);
-        CHECK(td.has_value() && fs::is_directory(td->path()), "TempDir created");
-        tree = td->path();
-        write_file(*td / "inner.txt", "x");
+        CHECK(td && fs::is_directory(td.path()), "TempDir created");
+        tree = td.path();
+        write_file(td / "inner.txt", "x");
     }
     CHECK(!fs::exists(tree), "TempDir removed recursively");
 }
@@ -583,7 +286,7 @@ static void test_which(const fs::path& dir) {
         ::setenv("PATH", path, 1);
         auto found = shrn::which("which-tool");
         auto ran = shrn::run({"which-tool"});
-        CHECK(found && fs::equivalent(*found, tool) && ran && ran->success(),
+        CHECK(found && fs::equivalent(*found, tool) && ran.launched() && ran.success(),
               "empty PATH components resolve the current directory like execvp");
     }
     CHECK(!shrn::which(dir.string()), "which rejects explicit directory paths");
@@ -599,7 +302,7 @@ static void test_which(const fs::path& dir) {
     ::unsetenv("PATH");
     auto shell = shrn::which("sh");
     auto ran = shrn::run({"sh", "-c", "exit 0"});
-    CHECK(shell && ran && ran->success(), "unset PATH uses the system executable search path");
+    CHECK(shell && ran.launched() && ran.success(), "unset PATH uses the system executable search path");
     if (previous_path) ::setenv("PATH", previous_path->c_str(), 1);
     else ::unsetenv("PATH");
     fs::current_path(previous_dir);
@@ -609,31 +312,34 @@ static void test_process(const fs::path& dir) {
     std::fprintf(stderr, "process\n");
 
     CHECK(shrn::format_command({"a", "b c", "it's", ""}) == "a 'b c' 'it'\\''s' ''", "format_command quoting");
-    CHECK(shrn::which("sh").has_value(), "which finds sh");
-    CHECK(!shrn::which("shrn-definitely-not-a-command").has_value(), "which misses");
-    CHECK(shrn::which("/bin/sh").has_value(), "which accepts absolute path");
+    CHECK(static_cast<bool>(shrn::which("sh")), "which finds sh");
+    CHECK(!shrn::which("shrn-definitely-not-a-command"), "which misses");
+    CHECK(static_cast<bool>(shrn::which("/bin/sh")), "which accepts absolute path");
 
     auto ok = shrn::run({"true"});
-    CHECK(ok && ok->success() && ok->exit_code == 0, "true succeeds");
+    CHECK(ok.launched() && ok.success() && ok.exit_code == 0, "true succeeds");
 
     auto empty = shrn::run({});
-    CHECK(!empty && empty.error() == shrn::errc::empty_command, "empty argv -> errc::empty_command");
+    CHECK(!empty.launched() && empty.error == "empty command", "empty argv fails with 'empty command'");
 
     auto enoent = shrn::run({"shrn-definitely-not-a-command"});
-    CHECK(!enoent && enoent.error() == std::errc::no_such_file_or_directory, "missing binary -> ENOENT, not exit 127");
+    CHECK(!enoent.launched() &&
+              enoent.error.find("No such file or directory") != std::string::npos,
+          "missing binary -> exec error, not exit 127");
 
     auto code = shrn::run({"sh", "-c", "echo oops >&2; exit 3"});
-    CHECK(code && !code->success() && code->exit_code == 3, "exit code propagated");
-    CHECK(code->stderr_output == "oops\n", "stderr captured");
+    CHECK(code.launched() && !code.success() && code.exit_code == 3, "exit code propagated");
+    CHECK(code.stderr_output == "oops\n", "stderr captured");
 
     shrn::RunOptions no_capture;
     no_capture.capture_stderr = false;
     no_capture.inherit_stdout = false;
     auto quiet = shrn::run({"sh", "-c", "echo not-captured >&2; echo swallowed"}, no_capture);
-    CHECK(quiet && quiet->success() && quiet->stderr_output.empty(), "capture_stderr=false leaves stderr empty");
+    CHECK(quiet.launched() && quiet.success() && quiet.stderr_output.empty(),
+          "capture_stderr=false leaves stderr empty");
 
     auto sig = shrn::run({"sh", "-c", "kill -9 $$"});
-    CHECK(sig && sig->signal == 9 && sig->exit_code == -1 && !sig->success(), "signal death reported");
+    CHECK(sig.launched() && sig.signal == 9 && sig.exit_code == -1 && !sig.success(), "signal death reported");
 
     shrn::RunOptions redirect;
     redirect.stdout_file = dir / "out.txt";
@@ -641,14 +347,15 @@ static void test_process(const fs::path& dir) {
     std::string spawned;
     redirect.on_spawn = [&](std::string_view st, std::string_view cmd) { spawned = std::string(st) + "|" + std::string(cmd); };
     auto red = shrn::run({"sh", "-c", "pwd"}, redirect);
-    CHECK(red && red->success(), "redirect run ok");
-    CHECK(shrn::read_file(dir / "out.txt").value() == fs::canonical(dir).string() + "\n", "stdout_file + workdir");
+    CHECK(red.launched() && red.success(), "redirect run ok");
+    CHECK(slurp(dir / "out.txt") == fs::canonical(dir).string() + "\n", "stdout_file + workdir");
     CHECK(spawned == "|sh -c pwd", "on_spawn receives empty stage and formatted command from run()");
 
     shrn::RunOptions badwd;
     badwd.workdir = dir / "nowhere";
     auto wd = shrn::run({"true"}, badwd);
-    CHECK(!wd && wd.error() == std::errc::no_such_file_or_directory, "bad workdir -> launch error");
+    CHECK(!wd.launched() && wd.error.find("No such file or directory") != std::string::npos,
+          "bad workdir -> launch error");
 }
 
 // process: stderr capture and file descriptors
@@ -658,41 +365,40 @@ static void test_process_edges(const fs::path& dir) {
 
     // Capture all stderr, both when it fits in the pipe and when it exceeds capacity.
     auto buffered = shrn::run({self, "--helper=emit-bytes", "60000"});
-    CHECK(buffered && buffered->success() && buffered->stderr_output == std::string(60000, 'x'),
+    CHECK(buffered.launched() && buffered.success() && buffered.stderr_output == std::string(60000, 'x'),
           "stderr buffered by an exited child is drained completely");
     auto streamed = shrn::run({self, "--helper=emit-bytes", "1048576"});
-    CHECK(streamed && streamed->success() && streamed->stderr_output == std::string(1048576, 'x'),
+    CHECK(streamed.launched() && streamed.success() && streamed.stderr_output == std::string(1048576, 'x'),
           "stderr larger than the pipe is captured completely");
 
     // Closing stderr early is not an exit: a timed wait must still expire.
     auto closed = shrn::spawn({self, "--helper=close-stderr-sleep", "600"});
-    CHECK(closed.has_value(), "spawn child that closes stderr");
-    if (closed) {
-        auto expired = closed->wait_for(100ms);
-        CHECK(expired && *expired == shrn::wait_status::timeout,
+    CHECK(closed.error().empty(), "spawn child that closes stderr");
+    if (closed.error().empty()) {
+        CHECK(closed.wait_for(100ms) == shrn::wait_status::timeout,
               "early stderr EOF is not mistaken for child exit");
-        auto& r = closed->wait();
-        CHECK(r && r->success(), "child that closed stderr reports its real exit status");
+        auto& r = closed.wait();
+        CHECK(r.launched() && r.success(), "child that closed stderr reports its real exit status");
     }
 
     // Descendants holding stderr must not delay the direct child's result.
     auto t0 = std::chrono::steady_clock::now();
     auto orphan = shrn::run({self, "--helper=orphan-stderr", "3000"});
     auto elapsed = std::chrono::steady_clock::now() - t0;
-    CHECK(orphan && orphan->success() && orphan->stderr_output == "direct\n",
+    CHECK(orphan.launched() && orphan.success() && orphan.stderr_output == "direct\n",
           "stderr written before exit survives a descendant holding the pipe");
     CHECK(elapsed < 1500ms, "run returns when the direct child exits, not when descendants do");
 
     auto held = shrn::spawn({self, "--helper=orphan-stderr", "3000"});
-    CHECK(held.has_value(), "spawn child with a descendant on stderr");
-    if (held) {
+    CHECK(held.error().empty(), "spawn child with a descendant on stderr");
+    if (held.error().empty()) {
         t0 = std::chrono::steady_clock::now();
-        auto ready = held->wait_for(2s);
-        auto& r = held->wait();
+        auto ready = held.wait_for(2s);
+        auto& r = held.wait();
         elapsed = std::chrono::steady_clock::now() - t0;
-        CHECK(ready && *ready == shrn::wait_status::ready,
+        CHECK(ready == shrn::wait_status::ready,
               "a timed wait returns when the direct child exits");
-        CHECK(r && r->success() && r->stderr_output == "direct\n",
+        CHECK(r.launched() && r.success() && r.stderr_output == "direct\n",
               "buffered stderr survives a descendant keeping the pipe open");
         CHECK(elapsed < 1500ms, "waiting ends with the direct child, not the descendant");
     }
@@ -705,22 +411,22 @@ static void test_process_edges(const fs::path& dir) {
     redirect.stdout_file = dir / "fdprobe.out";
     auto probe = shrn::run({self, "--helper=open-fds"}, redirect);
     bool leaked = false;
-    if (probe) {
-        for (std::size_t i = 0; i + 3 < probe->stderr_output.size();) {
-            std::size_t eol = probe->stderr_output.find('\n', i);
+    if (probe.launched()) {
+        for (std::size_t i = 0; i + 3 < probe.stderr_output.size();) {
+            std::size_t eol = probe.stderr_output.find('\n', i);
             if (eol == std::string::npos) break;
-            int fd = std::atoi(probe->stderr_output.c_str() + i + 3);  // skip "fd="
+            int fd = std::atoi(probe.stderr_output.c_str() + i + 3);  // skip "fd="
             bool inherited = false;
             for (int b : baseline) inherited = inherited || b == fd;
             if (!inherited) leaked = true;
             i = eol + 1;
         }
     }
-    CHECK(probe && probe->success() && !leaked, "run() leaks no pipe or redirection descriptor into the child");
+    CHECK(probe.launched() && probe.success() && !leaked, "run() leaks no pipe or redirection descriptor into the child");
 
     // Redirection must work even when the parent has closed descriptors 0/1/2.
     auto closed_stdio = shrn::run({self, "--helper=closed-stdio", dir.string()});
-    CHECK(closed_stdio && closed_stdio->success(),
+    CHECK(closed_stdio.launched() && closed_stdio.success(),
           "run() works with stdin/stdout/stderr closed (see helper exit code for the failing check)");
 }
 
@@ -736,34 +442,34 @@ static void test_process_spawn(const fs::path& dir) {
           "Process is movable");
     {
         shrn::Process unstarted;  // destroying an unstarted Process must be harmless
-        auto state = unstarted.running();
-        auto timed = unstarted.wait_for(0ms);
-        CHECK(!state, "running() on a Process without a child reports an error");
-        CHECK(!timed, "wait_for() on a Process without a child reports an error");
-        CHECK(!unstarted.wait(), "wait() on a Process without a child reports an error");
+        CHECK(!unstarted.running(), "running() on a Process without a child is false");
+        CHECK(unstarted.wait_for(0ms) == shrn::wait_status::ready,
+              "wait_for() on a Process without a child is ready");
+        CHECK(unstarted.wait().error == "no child process",
+              "wait() on a Process without a child records the error");
     }
 
     // Launch errors surface at spawn time, before any wait.
     auto empty = shrn::spawn({});
-    CHECK(!empty && empty.error() == shrn::errc::empty_command, "spawn: empty argv -> errc::empty_command");
+    CHECK(empty.error() == "empty command", "spawn: empty argv fails with 'empty command'");
     auto enoent = shrn::spawn({"shrn-definitely-not-a-command"});
-    CHECK(!enoent && enoent.error() == std::errc::no_such_file_or_directory,
+    CHECK(enoent.error().find("No such file or directory") != std::string::npos,
           "spawn reports the exec failure, not a started process");
     shrn::RunOptions badwd;
     badwd.workdir = dir / "nowhere";
     auto wd = shrn::spawn({"true"}, badwd);
-    CHECK(!wd && wd.error() == std::errc::no_such_file_or_directory, "spawn reports a bad workdir");
+    CHECK(wd.error().find("No such file or directory") != std::string::npos, "spawn reports a bad workdir");
 
     // Both children must be alive at the same time: each waits for the other's marker.
     auto ma = (dir / "spawn_a.mark").string();
     auto mb = (dir / "spawn_b.mark").string();
     auto pa = shrn::spawn({self, "--helper=rendezvous", ma, mb});
     auto pb = shrn::spawn({self, "--helper=rendezvous", mb, ma});
-    CHECK(pa && pb, "two children spawn without waiting");
-    if (pa && pb) {
-        auto& ra = pa->wait();
-        auto& rb = pb->wait();
-        CHECK(ra && ra->success() && rb && rb->success(),
+    CHECK(pa.error().empty() && pb.error().empty(), "two children spawn without waiting");
+    if (pa.error().empty() && pb.error().empty()) {
+        auto& ra = pa.wait();
+        auto& rb = pb.wait();
+        CHECK(ra.launched() && ra.success() && rb.launched() && rb.success(),
               "spawn returns before completion, so both children run concurrently");
     }
 
@@ -774,47 +480,45 @@ static void test_process_spawn(const fs::path& dir) {
     auto pbase = (dir / "proc_fds").string();
     auto holder = shrn::spawn({self, "--helper=pid-sleep-touch", pbase, "700"});
     auto probe = shrn::spawn({self, "--helper=open-fds"});
-    CHECK(holder && probe, "spawn a descriptor probe while another child is live");
-    if (holder && probe) {
-        auto& pr = probe->wait();
+    CHECK(holder.error().empty() && probe.error().empty(),
+          "spawn a descriptor probe while another child is live");
+    if (holder.error().empty() && probe.error().empty()) {
+        auto& pr = probe.wait();
         bool leaked = false;
-        if (pr) {
-            for (std::size_t i = 0; i + 3 < pr->stderr_output.size();) {
-                std::size_t eol = pr->stderr_output.find('\n', i);
+        if (pr.launched()) {
+            for (std::size_t i = 0; i + 3 < pr.stderr_output.size();) {
+                std::size_t eol = pr.stderr_output.find('\n', i);
                 if (eol == std::string::npos) break;
-                int fd = std::atoi(pr->stderr_output.c_str() + i + 3);  // skip "fd="
+                int fd = std::atoi(pr.stderr_output.c_str() + i + 3);  // skip "fd="
                 bool inherited = false;
                 for (int b : baseline) inherited = inherited || b == fd;
                 if (!inherited) leaked = true;
                 i = eol + 1;
             }
         }
-        CHECK(pr && pr->success() && !leaked, "a concurrent spawn inherits no descriptor of the live child");
-        auto& hr = holder->wait();
-        CHECK(hr && hr->success(), "the live child is unaffected by the concurrent spawn");
+        CHECK(pr.launched() && pr.success() && !leaked,
+              "a concurrent spawn inherits no descriptor of the live child");
+        auto& hr = holder.wait();
+        CHECK(hr.launched() && hr.success(), "the live child is unaffected by the concurrent spawn");
     }
 
     // running() / wait_for() observe a live child without killing it.
     auto lbase = (dir / "proc_live").string();
     auto live = shrn::spawn({self, "--helper=pid-sleep-touch", lbase, "700"});
-    CHECK(live.has_value(), "spawn a child that outlives the first check");
-    if (live) {
+    CHECK(live.error().empty(), "spawn a child that outlives the first check");
+    if (live.error().empty()) {
         auto pid = child_pid(lbase);
         CHECK(pid.has_value(), "spawned child published its pid");
-        auto expired = live->wait_for(50ms);
-        CHECK(expired && *expired == shrn::wait_status::timeout, "wait_for expires while the child runs");
-        auto alive = live->running();
-        CHECK(alive && *alive, "running() is true before exit and wait_for did not kill");
-        auto ready = live->wait_for(5s);
-        CHECK(ready && *ready == shrn::wait_status::ready, "wait_for observes the exit");
-        auto done = live->running();
-        CHECK(done && !*done, "running() is false after the child exits");
-        auto& r = live->wait();
-        CHECK(r && r->success(), "wait after wait_for reports the exit status");
-        auto& again = live->wait();
-        CHECK(again && again->exit_code == 0, "repeated wait returns the completed result");
+        CHECK(live.wait_for(50ms) == shrn::wait_status::timeout, "wait_for expires while the child runs");
+        CHECK(live.running(), "running() is true before exit and wait_for did not kill");
+        CHECK(live.wait_for(5s) == shrn::wait_status::ready, "wait_for observes the exit");
+        CHECK(!live.running(), "running() is false after the child exits");
+        auto& r = live.wait();
+        CHECK(r.launched() && r.success(), "wait after wait_for reports the exit status");
+        auto& again = live.wait();
+        CHECK(again.launched() && again.exit_code == 0, "repeated wait returns the completed result");
         CHECK(fs::exists(lbase + ".late"), "an unterminated child runs to completion");
-        CHECK(live->terminate().has_value(), "terminate on a finished process succeeds");
+        live.terminate();  // void return; a finished child is simply re-waited
         if (pid) {
             CHECK(reaped(*pid), "a waited child leaves no zombie");
             force_kill(*pid);
@@ -824,14 +528,14 @@ static void test_process_spawn(const fs::path& dir) {
     // terminate() kills the direct child and finalizes its status.
     auto kbase = (dir / "proc_kill").string();
     auto doomed = shrn::spawn({self, "--helper=pid-sleep-touch", kbase, "4000"});
-    CHECK(doomed.has_value(), "spawn a child to terminate");
-    if (doomed) {
+    CHECK(doomed.error().empty(), "spawn a child to terminate");
+    if (doomed.error().empty()) {
         auto pid = child_pid(kbase);
         auto t0 = std::chrono::steady_clock::now();
-        CHECK(doomed->terminate().has_value(), "terminate succeeds on a live child");
-        auto& r = doomed->wait();
+        doomed.terminate();
+        auto& r = doomed.wait();
         auto elapsed = std::chrono::steady_clock::now() - t0;
-        CHECK(r && r->signal == SIGKILL && !r->success(), "terminated child reports SIGKILL");
+        CHECK(r.launched() && r.signal == SIGKILL && !r.success(), "terminated child reports SIGKILL");
         CHECK(elapsed < 2s, "terminate does not wait out the child's sleep");
         CHECK(!fs::exists(kbase + ".late"), "terminated child never finished its work");
         if (pid) {
@@ -844,17 +548,17 @@ static void test_process_spawn(const fs::path& dir) {
     shrn::RunOptions to_file;
     to_file.stdout_file = dir / "moved.out";
     auto src = shrn::spawn({self, "--helper=emit"}, to_file);
-    CHECK(src.has_value(), "spawn a child for the move test");
-    if (src) {
+    CHECK(src.error().empty(), "spawn a child for the move test");
+    if (src.error().empty()) {
         shrn::Process slot;
         {
-            shrn::Process moved(std::move(*src));
+            shrn::Process moved(std::move(src));
             slot = std::move(moved);
-        }  // both moved-from objects are destroyed while the child is still unwaited
+        }  // the moved-from objects are destroyed while the child is still unwaited
         auto& r = slot.wait();
-        CHECK(r && r->exit_code == 7 && r->stderr_output == "ERR\n",
+        CHECK(r.launched() && r.exit_code == 7 && r.stderr_output == "ERR\n",
               "a moved Process keeps its child and captured stderr");
-        CHECK(shrn::read_file(dir / "moved.out").value_or(std::string()) == "OUT\n",
+        CHECK(slurp(dir / "moved.out") == "OUT\n",
               "stdout_file redirection survives the move");
     }
 
@@ -863,7 +567,7 @@ static void test_process_spawn(const fs::path& dir) {
     std::optional<pid_t> dpid;
     {
         auto owned = shrn::spawn({self, "--helper=pid-sleep-touch", dbase, "300"});
-        CHECK(owned.has_value(), "spawn a child for the destructor test");
+        CHECK(owned.error().empty(), "spawn a child for the destructor test");
         dpid = child_pid(dbase);
     }
     CHECK(fs::exists(dbase + ".late"), "the destructor waits for the pending child");
@@ -875,17 +579,14 @@ static void test_process_spawn(const fs::path& dir) {
     // A capturing reader drains a full pipe while the caller does unrelated work.
     auto flood_base = (dir / "proc_flood").string();
     auto flood = shrn::spawn({self, "--helper=emit-bytes", "1048576", flood_base});
-    CHECK(flood.has_value(), "spawn a stderr flood");
-    if (flood) {
+    CHECK(flood.error().empty(), "spawn a stderr flood");
+    if (flood.error().empty()) {
         auto pid = child_pid(flood_base);
-        bool finished_before_wait = wait_until([&] {
-            auto active = flood->running();
-            return active && !*active;
-        }, 2s);
+        bool finished_before_wait = wait_until([&] { return !flood.running(); }, 2s);
         CHECK(finished_before_wait, "capture reader lets the child finish before wait()");
         if (!finished_before_wait && pid) force_kill(*pid);
-        auto& r = flood->wait();
-        CHECK(r && r->success() && r->stderr_output == std::string(1048576, 'x'),
+        auto& r = flood.wait();
+        CHECK(r.launched() && r.success() && r.stderr_output == std::string(1048576, 'x'),
               "captured stderr past the pipe capacity is drained by the reader");
     }
 
@@ -894,12 +595,12 @@ static void test_process_spawn(const fs::path& dir) {
     big_out.stdout_file = dir / "spawn_big.out";
     big_out.capture_stderr = false;
     auto redirected = shrn::spawn({self, "--helper=emit-out-bytes", "1048576"}, big_out);
-    CHECK(redirected.has_value(), "spawn a stdout flood without capture");
-    if (redirected) {
-        auto& r = redirected->wait();
-        CHECK(r && r->success() && r->stderr_output.empty(),
+    CHECK(redirected.error().empty(), "spawn a stdout flood without capture");
+    if (redirected.error().empty()) {
+        auto& r = redirected.wait();
+        CHECK(r.launched() && r.success() && r.stderr_output.empty(),
               "capture_stderr=false leaves stderr_output empty");
-        CHECK(shrn::read_file(dir / "spawn_big.out").value_or(std::string()) == std::string(1048576, 'o'),
+        CHECK(slurp(dir / "spawn_big.out") == std::string(1048576, 'o'),
               "stdout_file receives the whole stream without a reader");
     }
 }
@@ -928,10 +629,8 @@ static void test_outcome(const fs::path& dir) {
     auto o3 = shrn::Outcome().expect_file(blank, shrn::Expect::NON_EMPTY);
     CHECK(!o3.ok() && o3.detail() == "empty: " + blank.string(), "empty reported");
 
-    auto o4 = shrn::Outcome().expect_file(present, shrn::Expect::GZIPPED);
-    CHECK(!o4.ok() && o4.detail() == "not gzipped: " + present.string(), "gzip flag");
 
-    auto is_fastq = [](const fs::path& p) { return shrn::file_first_byte(p).value_or(-1) == '@'; };
+    auto is_fastq = [](const fs::path& p) { return std::ifstream(p).get() == '@'; };
     auto o5 = shrn::Outcome().expect_file(present, is_fastq, "FASTQ");
     CHECK(o5.ok(), "predicate passes");
     auto o6 = shrn::Outcome().expect_file(blank, is_fastq, "FASTQ");
@@ -1029,7 +728,7 @@ static void test_outcome_async(const fs::path& dir) {
                        .proc({"sh", "-c", "printf second >> " + seq.string()})
                        .expect_file(seq, shrn::Expect::NON_EMPTY);
     CHECK(ordered.ok(), "sequenced commands both succeed");
-    CHECK(shrn::read_file(seq).value_or(std::string()) == "firstsecond",
+    CHECK(slurp(seq) == "firstsecond",
           "a following command starts only after the previous one finished");
 
     // A deferred predicate is evaluated once, after the command exits.
@@ -1161,7 +860,7 @@ static void test_outcome_async(const fs::path& dir) {
                              },
                              std::move(suffix), echoed);
     CHECK(sequenced.ok(), "a stage whose call() returns zero succeeds");
-    CHECK(shrn::read_file(appended).value_or(std::string()) == "firstsecond",
+    CHECK(slurp(appended) == "firstsecond",
           "call() runs only after the previous command finished");
     CHECK(echoed == "second" && !suffix,
           "call() forwards a move-only callable, a move-only argument and an lvalue output");
@@ -1258,19 +957,18 @@ int main(int argc, char** argv) {
     }
     auto root = shrn::TempDir::create("shrn_test_");
     if (!root) {
-        std::fprintf(stderr, "cannot create temp dir: %s\n", root.error().message().c_str());
+        std::fprintf(stderr, "cannot create temp dir\n");
         return 2;
     }
 
-    test_expected();
-    test_files(root->path());
-    test_temp(root->path());
-    test_which(root->path());
-    test_process(root->path());
-    test_process_edges(root->path());
-    test_process_spawn(root->path());
-    test_outcome(root->path());
-    test_outcome_async(root->path());
+    test_files(root.path());
+    test_temp(root.path());
+    test_which(root.path());
+    test_process(root.path());
+    test_process_edges(root.path());
+    test_process_spawn(root.path());
+    test_outcome(root.path());
+    test_outcome_async(root.path());
 
     std::fprintf(stderr, "%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
