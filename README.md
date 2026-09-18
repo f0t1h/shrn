@@ -2,64 +2,214 @@
 
 Run subcommands and verify their outputs. Single header, C++20, POSIX.
 
+## Example
+
+Sort an existing `input.txt` into `sorted.txt`. Failed input checks prevent the
+command from running; a command or output-check failure is reported under the
+stage name.
+
 ```cpp
 #include <shrn.hpp>
 
-shrn::stage("minimap2 alignment")
-    .expect_which("minimap2")                        // pre-run: fail fast, nothing spawned
-    .expect_file(ref, shrn::Expect::NON_EMPTY)
-    .expect_file(reads, is_fastq, "FASTQ")          // any bool(const fs::path&)
-    .proc({"minimap2", "-x", "map-ont", ref, reads}, opts)
-    .expect_file(paf, shrn::Expect::NON_EMPTY)      // post-run
-    .proc({"sort", "-k1,1", "-o", paf, paf})    // only if everything above passed
-    .or_die_if(!soft_fail)                          // report + exit under the stage name, or warn and continue
-    .or_execute([&] { recover(); });
+int main() {
+    shrn::RunOptions options;
+    options.stdout_file = "sorted.txt";
+
+    shrn::stage("sort input")
+        .expect_which("sort")
+        .expect_file("input.txt", shrn::Expect::NON_EMPTY)
+        .proc({"sort", "input.txt"}, options)
+        .expect_file("sorted.txt", shrn::Expect::NON_EMPTY)
+        .or_die_if(true);
+}
 ```
 
-Everything except `Outcome::or_die_if` is silent and never exits: failures come
-back as `shrn::result<T>` = `expected<T, std::error_code>`.
+`or_die_if(true)` prints a failure and exits. To handle failures yourself, store
+the `Outcome` and inspect `ok()`, `detail()`, and `stderr_output()` instead.
 
-## Contents
+## Results
 
-| Area | API |
+Functions such as `read_file` and `run` return `shrn::result<T>`, an
+`expected<T, std::error_code>`. Check the result before dereferencing it:
+`if (!r)` indicates an error; `r.error().message()` describes it. Calling
+`value()` on an error throws `shrn::bad_expected_access<std::error_code>`.
+
+`shrn::expected` uses `std::expected` when available, otherwise the fallback
+implementation in the header. The fallback supports `value`, `error`, `value_or`,
+`and_then`, `transform`, `or_else`, `transform_error`, and `expected<void, E>`.
+Define `SHRN_FORCE_FALLBACK_EXPECTED=1` to select it explicitly.
+
+These functions do not print diagnostics or exit. `Outcome::or_die_if` handles
+reporting; child programs and user callbacks control their own output.
+Allocation failures and exceptions from callbacks are not converted to error codes.
+
+## Processes
+
+`spawn(args, options)` starts a child and returns `result<Process>` after exec
+succeeds. `run(args, options)` is the synchronous version: spawn, then wait.
+Both use `fork` and `execvp`, search PATH, and inherit the
+environment. Pass each argument as a separate string. The argument list is not
+parsed as a shell command: pipes, wildcards, and redirection are not expanded.
+`which(name)` searches for an executable; `format_command(args)` quotes arguments
+for display, not execution.
+
+| `RunOptions` field | Behavior |
 |---|---|
-| `expected` | `shrn::expected`, `shrn::unexpected`, `shrn::result<T>` — `std::expected` when the standard library has it (C++23), otherwise an in-header polyfill with the same surface (`value`, `error`, `value_or`, `and_then`, `transform`, `or_else`, `transform_error`, `expected<void, E>`). Force the polyfill with `-DSHRN_FORCE_POLYFILL=1`. |
-| Files | `file_readable`, `file_non_empty`, `file_is_gzipped` (magic bytes), `read_file`, `file_first_byte` (gzip-transparent), `line_count` (gzip-transparent, gzip detected by magic not extension), `ensure_directory`, `remove_if_exists`, `force_symlink`, `concat_files(inputs, out, concat_mode::raw|decompress)` |
-| Temp | `make_temp_file[_in]` (`mkstemps`), `make_temp_dir[_in]` (`mkdtemp`), RAII `TempFile`, `TempDir` |
-| Process | `run(args, RunOptions)` → `result<RunResult>`; `which`, `format_command` |
-| Outcome | `stage(name)`, `proc` (free and member), `expect_file`, `expect_which`, `expect_success(int)`, `expect(bool, detail)`, `or_execute`, `or_die_if`, `with_error`, `with_stderr` |
+| `workdir` | Change the child's directory before exec. |
+| `capture_stderr` | Capture stderr using one reader thread; default `true`. |
+| `inherit_stdout` | Default `true`; `false` sends stdout to `/dev/null`. |
+| `stdout_file` | Create or truncate this file; overrides `inherit_stdout`. Relative paths use the caller's directory, not `workdir`. |
+| `on_spawn` | Callback receiving the stage name and formatted command before launch. Uses `default_spawn_hook()` when unset. |
 
-### `run`
+The error side of `result<RunResult>` reports operating-system failures, including
+launch errors (`ENOENT` for a missing binary, bad `workdir`, pipe/fork errors)
+and failures while reading or waiting. Launch errors are detected via a
+`CLOEXEC` status pipe, not reported as exit code 127. A child that ran and
+failed is a value with `!success()`; `summary()` describes its exit code or signal.
 
-`fork`/`execvp` with PATH search and the environment inherited unchanged.
-`RunOptions`: `workdir`, `capture_stderr` (default on), `inherit_stdout`,
-`stdout_file`, `timeout` (child gets `SIGKILL` on expiry; `RunResult::timed_out`),
-`on_spawn(stage, cmd)` observer; when unset, `shrn::default_spawn_hook()` is used
-(assign it once for a process-wide "Running: ..." log line).
+`Process` is move-only and owns its direct child:
 
-The error side of `result<RunResult>` is reserved for *launch* failures
-(`ENOENT` for a missing binary, bad `workdir`, pipe/fork errors), detected via
-a `CLOEXEC` status pipe rather than a fake exit code 127. A child that ran and
-failed is a value with `!success()`; `summary()` describes exit code / signal /
-timeout.
+| Method | Behavior |
+|---|---|
+| `running()` | Nonblocking `result<bool>` status query. |
+| `wait()` | Wait indefinitely and return a reference to the cached `result<RunResult>`. |
+| `wait_for(duration)` | Return `result<wait_status>`: `ready` or `timeout`. Expiry neither kills nor fails the child. |
+| `terminate()` | SIGKILL and reap the direct child, returning `result<void>`. |
 
-### `Outcome`
+Durations are milliseconds measured from the wait call, not launch. A zero or
+negative duration polls once. No background timer monitors the child.
+Destruction waits and reaps silently; move assignment first waits for the
+previously owned child. Do not call methods concurrently on the same handle.
 
-A stage is a timeline: checks and `proc` calls in the order they happen.
-The first failure short-circuits the rest — later commands are not spawned —
-so `detail()` names the earliest problem. Checks placed before a `proc`
-are preconditions; the same methods after it verify outputs. Once a command
-has run, details are prefixed with its argv[0] (`"minimap2: exited with code 1"`,
-`"minimap2: missing: out.paf"`). `or_die_if(cond)` reports under the stage
+Only stderr capture needs a reader thread; `stdout_file` is ordinary file
+redirection. Waiting collects buffered stderr without waiting for descendants
+to close inherited writers; later descendant output is not captured. Termination
+does not kill a process group. Internal descriptors are closed across exec.
+Spawn hooks run on the launching thread.
+
+## Stages
+
+A stage starts each command asynchronously. Its next `proc` or ordinary
+expectation waits for that command before proceeding.
+After the first failure, later checks and commands are skipped.
+`detail()` describes that first failure. Checks before a `proc` validate its
+inputs; checks after it verify its outputs. Once a command has run, its argv[0]
+prefixes error details (for example, `"minimap2: missing: out.paf"`).
+`or_die_if(cond)` reports under the stage
 name (or the last command when the stage is anonymous); `or_die_if(cond, name)`
 overrides it.
 
-### zlib
+`expect_file(path)` requires a readable regular file. Add `Expect::NON_EMPTY`
+or `Expect::GZIPPED` (combinable with `|`), or pass a predicate and a label:
+`expect_file(path, predicate, "FASTQ")`. The predicate receives `const std::filesystem::path&`
+and returns whether the file is acceptable.
 
-Detected with `__has_include(<zlib.h>)`; `SHRN_HAS_ZLIB` is `1` or `0`. Disable
-with `-DSHRN_NO_ZLIB=1` (the CMake target does this automatically when zlib is
-not found or `SHRN_USE_ZLIB=OFF`). Without zlib, `file_is_gzipped` still works;
-gzip-transparent readers return `shrn::errc::zlib_unavailable` for gzip input.
+Use `expect([&] { return check_output(); }, "output check")` to evaluate a check
+after the command finishes. With `expect(bool, label)`, C++ evaluates the boolean
+argument before the method can wait.
+
+`call(fn, args...)` waits for the previous command, then invokes the function
+on the caller's thread with perfectly forwarded arguments. Return `0` for success
+or a nonzero integer for failure; later calls, commands, and checks are skipped
+after failure. Pass output arguments by reference. Exceptions propagate.
+Calls are synchronous: process deadlines and termination do not interrupt them.
+
+```cpp
+#include <shrn.hpp>
+
+int main() {
+    int output = 0;
+    shrn::stage("calculate")
+        .call([](int input, int& result) {
+            result = input * 2;
+            return 0;
+        }, 21, output)
+        .expect([&] { return output == 42; }, "incorrect result")
+        .or_die_if(true);
+}
+```
+
+| `Outcome` method | Behavior |
+|---|---|
+| `wait()` | Fluent untimed wait, even after a recorded failure. |
+| `wait_for(duration)` | Return `wait_status::ready` or `timeout`; expiry does not fail the stage. |
+| `running()` | Nonblocking query; does not wait for completion. |
+| `expect_done_within(duration)` | Wait up to the duration and record failure on expiry, without killing. |
+| `or_terminate()` | On recorded failure, kill and reap the active direct child without waiting first. Preserve the first failure. |
+
+`ok()`, `code()`, `detail()`, `stderr_output()`, and failure handlers wait while
+no failure is recorded. After a deadline failure they return or act immediately.
+Captured stderr is finalized by waiting or termination, not exposed as a live
+snapshot. A later successful wait does not clear a deadline failure.
+
+Start separate stages before joining them with `after`; no prior `wait()` is needed:
+
+```cpp
+#include <shrn.hpp>
+
+int main() {
+    auto first = shrn::stage("first").proc({"sleep", "1"});
+    auto second = shrn::stage("second").proc({"sleep", "1"});
+    shrn::stage("dependent")
+        .after(first, second)
+        .proc({"echo", "both succeeded"})
+        .or_die_if(true);
+}
+```
+
+`after(a, b, ...)` waits for the receiving stage's active command and every
+prerequisite, even if a failure has already been recorded. It permits subsequent
+work only if all succeeded. Otherwise it preserves the receiving stage's existing
+failure, or records the first failed prerequisite in argument order with its name
+and failure detail. It does not combine stderr or cancel siblings.
+
+Prerequisites are borrowed for the call, not moved or retained; their results
+remain available and can be reused by other dependent stages. A prerequisite
+with a recorded deadline failure is still joined, so terminate it explicitly
+before `after` if an untimed wait is unwanted.
+
+Stages are move-only. Their destructors wait silently, including after a failed
+deadline expectation: use `or_terminate()` if waiting indefinitely is unwanted.
+`or_die_if(true)` terminates its own active child before exiting on failure.
+It does not clean up sibling stages; `std::exit` does not destroy local objects.
+
+`or_die_if(false)` warns and continues. `or_execute(fn)` calls `fn` on failure
+but does not clear the failed state. `with_error` and `with_stderr` replace the
+stored text; they do not mark the stage as failed.
+
+## Files
+
+- `file_readable`, `file_non_empty`, and `file_is_gzipped` return booleans.
+  Gzip detection checks magic bytes, not the filename extension.
+- `read_file` returns raw bytes as a string; it does not decompress gzip.
+- `file_first_byte` and `line_count` read plain or gzip data. `line_count`
+  counts newline bytes, so an unterminated last line is not counted.
+- `ensure_directory` creates missing parent directories. `remove_if_exists`
+  succeeds if the path is absent. `force_symlink` removes the destination before
+  creating the link; a creation error does not restore the old destination.
+- `concat_files(inputs, output, mode)` copies bytes in `raw` mode or decompresses
+  gzip in `decompress` mode. It truncates the output first and can leave partial
+  output on error. The output must not refer to an input file.
+
+## Temporary files
+
+`make_temp_file` and `make_temp_dir` create paths in `$TMPDIR`, or `/tmp` when
+unset or empty. Their `_in` variants take a destination directory. The caller is
+responsible for removing the returned paths.
+
+`TempFile::create` and `TempDir::create` return move-only owners. Destruction or
+`reset()` removes the file or directory tree; cleanup errors are ignored.
+`release()` returns the path and disables automatic removal.
+
+## Gzip support
+
+The header detects `<zlib.h>` and sets `SHRN_HAS_ZLIB` to `1` or `0`. When
+including the header directly, link zlib or define `SHRN_NO_ZLIB=1`.
+The CMake target handles this, including when `SHRN_USE_ZLIB=OFF`.
+
+Without zlib, magic-byte detection and raw file copying are available.
+Operations that require decompression return `shrn::errc::zlib_unavailable`;
+plain inputs to `concat_files(..., concat_mode::decompress)` are copied unchanged.
 
 ## Integration
 
@@ -69,13 +219,15 @@ CMake, FetchContent:
 include(FetchContent)
 FetchContent_Declare(shrn
     GIT_REPOSITORY https://github.com/f0t1h/shrn.git
-    GIT_TAG        v0.1.0)
+    GIT_TAG        v0.2.0)
 FetchContent_MakeAvailable(shrn)
 target_link_libraries(your_target PRIVATE shrn::shrn)
 ```
 
 Installed package: `find_package(shrn CONFIG REQUIRED)` then link `shrn::shrn`.
-Or copy `include/shrn.hpp` and link zlib yourself (or define `SHRN_NO_ZLIB`).
+Or copy `include/shrn.hpp`, enable thread support (`-pthread` with GCC/Clang on
+Linux), and link zlib yourself (or define `SHRN_NO_ZLIB=1`). The CMake target
+carries both dependencies.
 
 ## Tests
 
@@ -83,8 +235,14 @@ Or copy `include/shrn.hpp` and link zlib yourself (or define `SHRN_NO_ZLIB`).
 cmake -S . -B build && cmake --build build && ctest --test-dir build
 ```
 
-Two binaries: `shrn_tests_native` (C++23 when the compiler supports it, so
-`std::expected` is exercised) and `shrn_tests_polyfill` (`SHRN_FORCE_POLYFILL`).
+Two binaries: `shrn_tests_native` uses `std::expected` when available (C++23
+when supported); `shrn_tests_fallback` uses C++20 and `SHRN_FORCE_FALLBACK_EXPECTED`.
+
+GitHub Actions runs both binaries on Ubuntu 24.04 with GCC 14 and Clang 18,
+each with zlib enabled and disabled. Each job also installs to a custom header
+directory, then builds and runs a separate `find_package` consumer. CI runs on
+pushes, pull requests, and manual dispatch. Other POSIX platforms are not covered
+by this workflow.
 
 ## License
 

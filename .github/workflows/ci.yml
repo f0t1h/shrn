@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.compiler }} / zlib ${{ matrix.zlib }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [g++-14, clang++-18]
+        zlib: ['ON', 'OFF']
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y g++-14 clang-18 ninja-build zlib1g-dev
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_CXX_COMPILER=${{ matrix.compiler }}
+          -DSHRN_USE_ZLIB=${{ matrix.zlib }}
+          -DBUILD_TESTING=ON
+          -DCMAKE_INSTALL_INCLUDEDIR=include/shrn
+
+      - name: Build
+        run: cmake --build build --parallel 2
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --no-tests=error --timeout 60
+
+      - name: Install
+        run: cmake --install build --prefix "${{ runner.temp }}/shrn-install"
+
+      # Builds against the install tree only: a wrong INSTALL_INTERFACE include
+      # directory or a dropped Threads/zlib dependency fails this step.
+      - name: Consume installed package
+        run: |
+          cmake -S tests/install-consumer -B build-consumer -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_COMPILER=${{ matrix.compiler }} \
+            -DCMAKE_PREFIX_PATH="${{ runner.temp }}/shrn-install"
+          cmake --build build-consumer --parallel 2
+          ctest --test-dir build-consumer --output-on-failure --no-tests=error --timeout 60

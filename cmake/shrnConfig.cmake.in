@@ -1,6 +1,7 @@
 @PACKAGE_INIT@
 
 include(CMakeFindDependencyMacro)
+find_dependency(Threads)
 set(SHRN_WITH_ZLIB @SHRN_WITH_ZLIB@)
 if(SHRN_WITH_ZLIB)
     find_dependency(ZLIB)

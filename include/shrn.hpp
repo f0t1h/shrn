@@ -1,21 +1,6 @@
-/**
- * @file shrn.hpp
- * @brief shrn — run subcommands and verify their outputs.
- *
- * Single-header, C++20, POSIX. Optional zlib support (auto-detected via
- * __has_include, disable with -DSHRN_NO_ZLIB=1).
- *
- * Layers:
- *   - shrn::expected      std::expected when available, in-header polyfill otherwise
- *                         (force the polyfill with -DSHRN_FORCE_POLYFILL=1)
- *   - file queries        file_readable, file_is_gzipped, read_file, line_count, ...
- *   - temp files          make_temp_file (mkstemps), TempFile, TempDir
- *   - process             run(), which(), format_command()
- *   - Outcome             stage(name).expect_file(in).proc(cmd).expect_file(out).or_die_if(cond)
- *
- * Failures are reported as shrn::result<T> = expected<T, std::error_code>.
- * Only Outcome::or_die_if() writes to stderr / exits; everything else is silent.
- */
+// shrn: run commands and check their outputs. C++20, POSIX.
+// Define SHRN_NO_ZLIB to disable gzip support.
+// Define SHRN_FORCE_FALLBACK_EXPECTED to use the built-in expected implementation.
 
 #ifndef SHRN_HPP
 #define SHRN_HPP
@@ -32,10 +17,12 @@
 #include <functional>
 #include <initializer_list>
 #include <iterator>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -52,7 +39,7 @@
 #include <expected>
 #endif
 
-#if !defined(SHRN_FORCE_POLYFILL) && defined(__cpp_lib_expected) && __cpp_lib_expected >= 202202L
+#if !defined(SHRN_FORCE_FALLBACK_EXPECTED) && defined(__cpp_lib_expected) && __cpp_lib_expected >= 202202L
 #define SHRN_HAS_STD_EXPECTED 1
 #else
 #define SHRN_HAS_STD_EXPECTED 0
@@ -67,9 +54,7 @@
 
 namespace shrn {
 
-// ============================================================================
 // expected
-// ============================================================================
 
 #if SHRN_HAS_STD_EXPECTED
 
@@ -79,7 +64,7 @@ template <class E> using bad_expected_access = std::bad_expected_access<E>;
 using unexpect_t = std::unexpect_t;
 using std::unexpect;
 
-#else  // polyfill
+#else  // fallback implementation
 
 struct unexpect_t {
     explicit unexpect_t() = default;
@@ -165,8 +150,35 @@ public:
         : v_(std::in_place_index<0>) {}
     constexpr expected(const expected&) = default;
     constexpr expected(expected&&) = default;
-    constexpr expected& operator=(const expected&) = default;
-    constexpr expected& operator=(expected&&) = default;
+
+    // Assign in place when the state is unchanged. If constructing the other
+    // alternative throws, restore the previous state.
+    constexpr expected& operator=(const expected& rhs) noexcept(
+        std::is_nothrow_copy_constructible_v<T> && std::is_nothrow_copy_assignable_v<T> &&
+        std::is_nothrow_copy_constructible_v<E> && std::is_nothrow_copy_assignable_v<E>)
+        requires(std::is_copy_constructible_v<T> && std::is_copy_assignable_v<T> &&
+                 std::is_copy_constructible_v<E> && std::is_copy_assignable_v<E> &&
+                 (std::is_nothrow_move_constructible_v<T> || std::is_nothrow_move_constructible_v<E>))
+    {
+        if (has_value() && rhs.has_value()) **this = *rhs;
+        else if (!has_value() && !rhs.has_value()) error() = rhs.error();
+        else if (rhs.has_value()) reinit<0>(*rhs);
+        else reinit<1>(rhs.error());
+        return *this;
+    }
+    constexpr expected& operator=(expected&& rhs) noexcept(
+        std::is_nothrow_move_constructible_v<T> && std::is_nothrow_move_assignable_v<T> &&
+        std::is_nothrow_move_constructible_v<E> && std::is_nothrow_move_assignable_v<E>)
+        requires(std::is_move_constructible_v<T> && std::is_move_assignable_v<T> &&
+                 std::is_move_constructible_v<E> && std::is_move_assignable_v<E> &&
+                 (std::is_nothrow_move_constructible_v<T> || std::is_nothrow_move_constructible_v<E>))
+    {
+        if (has_value() && rhs.has_value()) **this = std::move(*rhs);
+        else if (!has_value() && !rhs.has_value()) error() = std::move(rhs.error());
+        else if (rhs.has_value()) reinit<0>(std::move(*rhs));
+        else reinit<1>(std::move(rhs.error()));
+        return *this;
+    }
 
     template <class U = T>
         requires(!std::is_same_v<std::remove_cvref_t<U>, std::in_place_t> &&
@@ -199,29 +211,75 @@ public:
     template <class U = T>
         requires(!std::is_same_v<std::remove_cvref_t<U>, expected> &&
                  !detail::is_unexpected<std::remove_cvref_t<U>>::value &&
-                 std::is_constructible_v<T, U> && std::is_assignable_v<T&, U>)
+                 std::is_constructible_v<T, U> && std::is_assignable_v<T&, U> &&
+                 (std::is_nothrow_constructible_v<T, U> || std::is_nothrow_move_constructible_v<T> ||
+                  std::is_nothrow_move_constructible_v<E>))
     constexpr expected& operator=(U&& u) {
-        v_.template emplace<0>(std::forward<U>(u));
+        if (has_value()) **this = std::forward<U>(u);
+        else reinit<0>(std::forward<U>(u));
         return *this;
     }
     template <class G>
+        requires(std::is_constructible_v<E, const G&> && std::is_assignable_v<E&, const G&> &&
+                 (std::is_nothrow_constructible_v<E, const G&> || std::is_nothrow_move_constructible_v<T> ||
+                  std::is_nothrow_move_constructible_v<E>))
     constexpr expected& operator=(const unexpected<G>& u) {
-        v_.template emplace<1>(u.error());
+        if (has_value()) reinit<1>(u.error());
+        else error() = u.error();
         return *this;
     }
     template <class G>
+        requires(std::is_constructible_v<E, G> && std::is_assignable_v<E&, G> &&
+                 (std::is_nothrow_constructible_v<E, G> || std::is_nothrow_move_constructible_v<T> ||
+                  std::is_nothrow_move_constructible_v<E>))
     constexpr expected& operator=(unexpected<G>&& u) {
-        v_.template emplace<1>(std::move(u).error());
+        if (has_value()) reinit<1>(std::move(u).error());
+        else error() = std::move(u).error();
         return *this;
     }
 
     template <class... Args>
-    constexpr T& emplace(Args&&... args) noexcept(std::is_nothrow_constructible_v<T, Args...>) {
+        requires std::is_nothrow_constructible_v<T, Args...>
+    constexpr T& emplace(Args&&... args) noexcept {
         return v_.template emplace<0>(std::forward<Args>(args)...);
     }
 
-    constexpr void swap(expected& other) noexcept(std::is_nothrow_swappable_v<std::variant<T, E>>) {
-        v_.swap(other.v_);
+    constexpr void swap(expected& other) noexcept(
+        std::is_nothrow_move_constructible_v<T> && std::is_nothrow_swappable_v<T> &&
+        std::is_nothrow_move_constructible_v<E> && std::is_nothrow_swappable_v<E>)
+        requires(std::is_swappable_v<T> && std::is_swappable_v<E> && std::is_move_constructible_v<T> &&
+                 std::is_move_constructible_v<E> &&
+                 (std::is_nothrow_move_constructible_v<T> || std::is_nothrow_move_constructible_v<E>))
+    {
+        using std::swap;
+        if (has_value() == other.has_value()) {
+            if (has_value()) swap(**this, *other);
+            else swap(error(), other.error());
+        } else if (!has_value()) {
+            other.swap(*this);
+        } else if constexpr (std::is_nothrow_move_constructible_v<E>) {
+            E tmp(std::move(other.error()));
+            if constexpr (std::is_nothrow_move_constructible_v<T>) {
+                other.v_.template emplace<0>(std::move(**this));
+            } else {
+                try {
+                    other.v_.template emplace<0>(std::move(**this));
+                } catch (...) {
+                    other.v_.template emplace<1>(std::move(tmp));  // nothrow
+                    throw;
+                }
+            }
+            v_.template emplace<1>(std::move(tmp));  // nothrow
+        } else {
+            T tmp(std::move(**this));  // nothrow: E is not nothrow-move-constructible, so T is
+            try {
+                v_.template emplace<1>(std::move(other.error()));
+            } catch (...) {
+                v_.template emplace<0>(std::move(tmp));  // nothrow
+                throw;
+            }
+            other.v_.template emplace<0>(std::move(tmp));  // nothrow
+        }
     }
 
     [[nodiscard]] constexpr bool has_value() const noexcept { return v_.index() == 0; }
@@ -243,6 +301,10 @@ public:
         return **this;
     }
     constexpr T&& value() && {
+        if (!has_value()) throw bad_expected_access<E>(std::move(error()));
+        return std::move(**this);
+    }
+    constexpr const T&& value() const&& {
         if (!has_value()) throw bad_expected_access<E>(std::move(error()));
         return std::move(**this);
     }
@@ -269,68 +331,70 @@ public:
         return has_value() ? static_cast<E>(std::forward<G>(dflt)) : std::move(error());
     }
 
-    // --- monadic ---
+    // Operations preserve the value's constness and reference category.
+    template <class F>
+    constexpr auto and_then(F&& f) & {
+        return do_and_then(*this, std::forward<F>(f));
+    }
     template <class F>
     constexpr auto and_then(F&& f) const& {
-        using U = std::remove_cvref_t<std::invoke_result_t<F, const T&>>;
-        static_assert(detail::is_expected<U>::value);
-        if (has_value()) return std::invoke(std::forward<F>(f), **this);
-        return U(unexpect, error());
+        return do_and_then(*this, std::forward<F>(f));
     }
     template <class F>
     constexpr auto and_then(F&& f) && {
-        using U = std::remove_cvref_t<std::invoke_result_t<F, T&&>>;
-        static_assert(detail::is_expected<U>::value);
-        if (has_value()) return std::invoke(std::forward<F>(f), std::move(**this));
-        return U(unexpect, std::move(error()));
+        return do_and_then(std::move(*this), std::forward<F>(f));
+    }
+    template <class F>
+    constexpr auto and_then(F&& f) const&& {
+        return do_and_then(std::move(*this), std::forward<F>(f));
+    }
+    template <class F>
+    constexpr auto transform(F&& f) & {
+        return do_transform(*this, std::forward<F>(f));
     }
     template <class F>
     constexpr auto transform(F&& f) const& {
-        using U = std::remove_cv_t<std::invoke_result_t<F, const T&>>;
-        if (!has_value()) return expected<U, E>(unexpect, error());
-        if constexpr (std::is_void_v<U>) {
-            std::invoke(std::forward<F>(f), **this);
-            return expected<void, E>();
-        } else {
-            return expected<U, E>(std::in_place, std::invoke(std::forward<F>(f), **this));
-        }
+        return do_transform(*this, std::forward<F>(f));
     }
     template <class F>
     constexpr auto transform(F&& f) && {
-        using U = std::remove_cv_t<std::invoke_result_t<F, T&&>>;
-        if (!has_value()) return expected<U, E>(unexpect, std::move(error()));
-        if constexpr (std::is_void_v<U>) {
-            std::invoke(std::forward<F>(f), std::move(**this));
-            return expected<void, E>();
-        } else {
-            return expected<U, E>(std::in_place, std::invoke(std::forward<F>(f), std::move(**this)));
-        }
+        return do_transform(std::move(*this), std::forward<F>(f));
+    }
+    template <class F>
+    constexpr auto transform(F&& f) const&& {
+        return do_transform(std::move(*this), std::forward<F>(f));
+    }
+    template <class F>
+    constexpr auto or_else(F&& f) & {
+        return do_or_else(*this, std::forward<F>(f));
     }
     template <class F>
     constexpr auto or_else(F&& f) const& {
-        using G = std::remove_cvref_t<std::invoke_result_t<F, const E&>>;
-        static_assert(detail::is_expected<G>::value);
-        if (has_value()) return G(std::in_place, **this);
-        return std::invoke(std::forward<F>(f), error());
+        return do_or_else(*this, std::forward<F>(f));
     }
     template <class F>
     constexpr auto or_else(F&& f) && {
-        using G = std::remove_cvref_t<std::invoke_result_t<F, E&&>>;
-        static_assert(detail::is_expected<G>::value);
-        if (has_value()) return G(std::in_place, std::move(**this));
-        return std::invoke(std::forward<F>(f), std::move(error()));
+        return do_or_else(std::move(*this), std::forward<F>(f));
+    }
+    template <class F>
+    constexpr auto or_else(F&& f) const&& {
+        return do_or_else(std::move(*this), std::forward<F>(f));
+    }
+    template <class F>
+    constexpr auto transform_error(F&& f) & {
+        return do_transform_error(*this, std::forward<F>(f));
     }
     template <class F>
     constexpr auto transform_error(F&& f) const& {
-        using G = std::remove_cv_t<std::invoke_result_t<F, const E&>>;
-        if (has_value()) return expected<T, G>(std::in_place, **this);
-        return expected<T, G>(unexpect, std::invoke(std::forward<F>(f), error()));
+        return do_transform_error(*this, std::forward<F>(f));
     }
     template <class F>
     constexpr auto transform_error(F&& f) && {
-        using G = std::remove_cv_t<std::invoke_result_t<F, E&&>>;
-        if (has_value()) return expected<T, G>(std::in_place, std::move(**this));
-        return expected<T, G>(unexpect, std::invoke(std::forward<F>(f), std::move(error())));
+        return do_transform_error(std::move(*this), std::forward<F>(f));
+    }
+    template <class F>
+    constexpr auto transform_error(F&& f) const&& {
+        return do_transform_error(std::move(*this), std::forward<F>(f));
     }
 
     template <class U, class G>
@@ -349,6 +413,63 @@ public:
     }
 
 private:
+    // Switch to alternative I; restore the previous alternative if construction throws.
+    template <std::size_t I, class... Args>
+    constexpr void reinit(Args&&... args) {
+        constexpr std::size_t J = I == 0 ? 1 : 0;
+        using New = std::variant_alternative_t<I, std::variant<T, E>>;
+        using Old = std::variant_alternative_t<J, std::variant<T, E>>;
+        if constexpr (std::is_nothrow_constructible_v<New, Args...>) {
+            v_.template emplace<I>(std::forward<Args>(args)...);
+        } else if constexpr (std::is_nothrow_move_constructible_v<New>) {
+            New tmp(std::forward<Args>(args)...);  // throws before the old value is touched
+            v_.template emplace<I>(std::move(tmp));
+        } else {
+            static_assert(std::is_nothrow_move_constructible_v<Old>);
+            Old tmp(std::move(*std::get_if<J>(&v_)));
+            try {
+                v_.template emplace<I>(std::forward<Args>(args)...);
+            } catch (...) {
+                v_.template emplace<J>(std::move(tmp));  // nothrow: never observably valueless
+                throw;
+            }
+        }
+    }
+
+    template <class Self, class F>
+    static constexpr auto do_and_then(Self&& self, F&& f) {
+        using U = std::remove_cvref_t<std::invoke_result_t<F, decltype(*std::forward<Self>(self))>>;
+        static_assert(detail::is_expected<U>::value, "and_then must return an expected");
+        if (!self.has_value()) return U(unexpect, std::forward<Self>(self).error());
+        return std::invoke(std::forward<F>(f), *std::forward<Self>(self));
+    }
+    template <class Self, class F>
+    static constexpr auto do_transform(Self&& self, F&& f) {
+        using U = std::remove_cv_t<std::invoke_result_t<F, decltype(*std::forward<Self>(self))>>;
+        if constexpr (std::is_void_v<U>) {
+            if (!self.has_value()) return expected<void, E>(unexpect, std::forward<Self>(self).error());
+            std::invoke(std::forward<F>(f), *std::forward<Self>(self));
+            return expected<void, E>();
+        } else {
+            if (!self.has_value()) return expected<U, E>(unexpect, std::forward<Self>(self).error());
+            return expected<U, E>(std::in_place, std::invoke(std::forward<F>(f), *std::forward<Self>(self)));
+        }
+    }
+    template <class Self, class F>
+    static constexpr auto do_or_else(Self&& self, F&& f) {
+        using G = std::remove_cvref_t<std::invoke_result_t<F, decltype(std::forward<Self>(self).error())>>;
+        static_assert(detail::is_expected<G>::value, "or_else must return an expected");
+        if (!self.has_value()) return std::invoke(std::forward<F>(f), std::forward<Self>(self).error());
+        return G(std::in_place, *std::forward<Self>(self));
+    }
+    template <class Self, class F>
+    static constexpr auto do_transform_error(Self&& self, F&& f) {
+        using G = std::remove_cv_t<std::invoke_result_t<F, decltype(std::forward<Self>(self).error())>>;
+        if (!self.has_value())
+            return expected<T, G>(unexpect, std::invoke(std::forward<F>(f), std::forward<Self>(self).error()));
+        return expected<T, G>(std::in_place, *std::forward<Self>(self));
+    }
+
     std::variant<T, E> v_;
 };
 
@@ -361,6 +482,7 @@ public:
     using unexpected_type = unexpected<E>;
     template <class U> using rebind = expected<U, E>;
 
+    // optional assignment preserves the value/error state when construction throws.
     constexpr expected() noexcept = default;
     constexpr expected(const expected&) = default;
     constexpr expected(expected&&) = default;
@@ -381,19 +503,38 @@ public:
     constexpr explicit expected(unexpect_t, Args&&... args) : e_(std::in_place, std::forward<Args>(args)...) {}
 
     template <class G>
+        requires(std::is_constructible_v<E, const G&> && std::is_assignable_v<E&, const G&>)
     constexpr expected& operator=(const unexpected<G>& u) {
-        e_.emplace(u.error());
+        if (e_.has_value()) *e_ = u.error();  // same state: assign, never reconstruct
+        else e_.emplace(u.error());           // throwing: stays in the value state
         return *this;
     }
     template <class G>
+        requires(std::is_constructible_v<E, G> && std::is_assignable_v<E&, G>)
     constexpr expected& operator=(unexpected<G>&& u) {
-        e_.emplace(std::move(u).error());
+        if (e_.has_value()) *e_ = std::move(u).error();
+        else e_.emplace(std::move(u).error());
         return *this;
     }
 
     constexpr void emplace() noexcept { e_.reset(); }
-    constexpr void swap(expected& other) noexcept(std::is_nothrow_swappable_v<std::optional<E>>) {
-        e_.swap(other.e_);
+    constexpr void swap(expected& other) noexcept(std::is_nothrow_move_constructible_v<E> &&
+                                                  std::is_nothrow_swappable_v<E>)
+        requires(std::is_swappable_v<E> && std::is_move_constructible_v<E>)
+    {
+        if (e_.has_value() == other.e_.has_value()) {
+            if (e_.has_value()) {
+                using std::swap;
+                swap(*e_, *other.e_);
+            }
+            return;
+        }
+        // Construct the destination error before clearing the source.
+        // If construction throws, the destination remains in the value state.
+        std::optional<E>& from = e_.has_value() ? e_ : other.e_;
+        std::optional<E>& to = e_.has_value() ? other.e_ : e_;
+        to.emplace(std::move(*from));
+        from.reset();
     }
 
     [[nodiscard]] constexpr bool has_value() const noexcept { return !e_.has_value(); }
@@ -420,67 +561,70 @@ public:
         return has_value() ? static_cast<E>(std::forward<G>(dflt)) : std::move(error());
     }
 
+    // Operations preserve the error's constness and reference category.
+    template <class F>
+    constexpr auto and_then(F&& f) & {
+        return do_and_then(*this, std::forward<F>(f));
+    }
     template <class F>
     constexpr auto and_then(F&& f) const& {
-        using U = std::remove_cvref_t<std::invoke_result_t<F>>;
-        static_assert(detail::is_expected<U>::value);
-        if (has_value()) return std::invoke(std::forward<F>(f));
-        return U(unexpect, error());
+        return do_and_then(*this, std::forward<F>(f));
     }
     template <class F>
     constexpr auto and_then(F&& f) && {
-        using U = std::remove_cvref_t<std::invoke_result_t<F>>;
-        static_assert(detail::is_expected<U>::value);
-        if (has_value()) return std::invoke(std::forward<F>(f));
-        return U(unexpect, std::move(error()));
+        return do_and_then(std::move(*this), std::forward<F>(f));
+    }
+    template <class F>
+    constexpr auto and_then(F&& f) const&& {
+        return do_and_then(std::move(*this), std::forward<F>(f));
+    }
+    template <class F>
+    constexpr auto transform(F&& f) & {
+        return do_transform(*this, std::forward<F>(f));
     }
     template <class F>
     constexpr auto transform(F&& f) const& {
-        using U = std::remove_cv_t<std::invoke_result_t<F>>;
-        if (!has_value()) return expected<U, E>(unexpect, error());
-        if constexpr (std::is_void_v<U>) {
-            std::invoke(std::forward<F>(f));
-            return expected<void, E>();
-        } else {
-            return expected<U, E>(std::in_place, std::invoke(std::forward<F>(f)));
-        }
+        return do_transform(*this, std::forward<F>(f));
     }
     template <class F>
     constexpr auto transform(F&& f) && {
-        using U = std::remove_cv_t<std::invoke_result_t<F>>;
-        if (!has_value()) return expected<U, E>(unexpect, std::move(error()));
-        if constexpr (std::is_void_v<U>) {
-            std::invoke(std::forward<F>(f));
-            return expected<void, E>();
-        } else {
-            return expected<U, E>(std::in_place, std::invoke(std::forward<F>(f)));
-        }
+        return do_transform(std::move(*this), std::forward<F>(f));
+    }
+    template <class F>
+    constexpr auto transform(F&& f) const&& {
+        return do_transform(std::move(*this), std::forward<F>(f));
+    }
+    template <class F>
+    constexpr auto or_else(F&& f) & {
+        return do_or_else(*this, std::forward<F>(f));
     }
     template <class F>
     constexpr auto or_else(F&& f) const& {
-        using G = std::remove_cvref_t<std::invoke_result_t<F, const E&>>;
-        static_assert(detail::is_expected<G>::value);
-        if (has_value()) return G();
-        return std::invoke(std::forward<F>(f), error());
+        return do_or_else(*this, std::forward<F>(f));
     }
     template <class F>
     constexpr auto or_else(F&& f) && {
-        using G = std::remove_cvref_t<std::invoke_result_t<F, E&&>>;
-        static_assert(detail::is_expected<G>::value);
-        if (has_value()) return G();
-        return std::invoke(std::forward<F>(f), std::move(error()));
+        return do_or_else(std::move(*this), std::forward<F>(f));
+    }
+    template <class F>
+    constexpr auto or_else(F&& f) const&& {
+        return do_or_else(std::move(*this), std::forward<F>(f));
+    }
+    template <class F>
+    constexpr auto transform_error(F&& f) & {
+        return do_transform_error(*this, std::forward<F>(f));
     }
     template <class F>
     constexpr auto transform_error(F&& f) const& {
-        using G = std::remove_cv_t<std::invoke_result_t<F, const E&>>;
-        if (has_value()) return expected<void, G>();
-        return expected<void, G>(unexpect, std::invoke(std::forward<F>(f), error()));
+        return do_transform_error(*this, std::forward<F>(f));
     }
     template <class F>
     constexpr auto transform_error(F&& f) && {
-        using G = std::remove_cv_t<std::invoke_result_t<F, E&&>>;
-        if (has_value()) return expected<void, G>();
-        return expected<void, G>(unexpect, std::invoke(std::forward<F>(f), std::move(error())));
+        return do_transform_error(std::move(*this), std::forward<F>(f));
+    }
+    template <class F>
+    constexpr auto transform_error(F&& f) const&& {
+        return do_transform_error(std::move(*this), std::forward<F>(f));
     }
 
     template <class G>
@@ -494,6 +638,40 @@ public:
     }
 
 private:
+    template <class Self, class F>
+    static constexpr auto do_and_then(Self&& self, F&& f) {
+        using U = std::remove_cvref_t<std::invoke_result_t<F>>;
+        static_assert(detail::is_expected<U>::value, "and_then must return an expected");
+        if (!self.has_value()) return U(unexpect, std::forward<Self>(self).error());
+        return std::invoke(std::forward<F>(f));
+    }
+    template <class Self, class F>
+    static constexpr auto do_transform(Self&& self, F&& f) {
+        using U = std::remove_cv_t<std::invoke_result_t<F>>;
+        if constexpr (std::is_void_v<U>) {
+            if (!self.has_value()) return expected<void, E>(unexpect, std::forward<Self>(self).error());
+            std::invoke(std::forward<F>(f));
+            return expected<void, E>();
+        } else {
+            if (!self.has_value()) return expected<U, E>(unexpect, std::forward<Self>(self).error());
+            return expected<U, E>(std::in_place, std::invoke(std::forward<F>(f)));
+        }
+    }
+    template <class Self, class F>
+    static constexpr auto do_or_else(Self&& self, F&& f) {
+        using G = std::remove_cvref_t<std::invoke_result_t<F, decltype(std::forward<Self>(self).error())>>;
+        static_assert(detail::is_expected<G>::value, "or_else must return an expected");
+        if (!self.has_value()) return std::invoke(std::forward<F>(f), std::forward<Self>(self).error());
+        return G();
+    }
+    template <class Self, class F>
+    static constexpr auto do_transform_error(Self&& self, F&& f) {
+        using G = std::remove_cv_t<std::invoke_result_t<F, decltype(std::forward<Self>(self).error())>>;
+        if (!self.has_value())
+            return expected<void, G>(unexpect, std::invoke(std::forward<F>(f), std::forward<Self>(self).error()));
+        return expected<void, G>();
+    }
+
     std::optional<E> e_;
 };
 
@@ -501,9 +679,7 @@ private:
 
 template <class T> using result = expected<T, std::error_code>;
 
-// ============================================================================
 // Error codes
-// ============================================================================
 
 enum class errc {
     empty_file = 1,     ///< file exists but has no content
@@ -615,9 +791,7 @@ inline std::error_code gz_error(gzFile gz) noexcept {
 
 }  // namespace detail
 
-// ============================================================================
 // File queries
-// ============================================================================
 
 /// Regular file that the current process may read.
 [[nodiscard]] inline bool file_readable(const fs::path& p) noexcept {
@@ -659,15 +833,17 @@ inline std::error_code gz_error(gzFile gz) noexcept {
             in.read(out.data(), static_cast<std::streamsize>(sz));
             out.resize(static_cast<std::size_t>(in.gcount()));
             if (in.bad()) return unexpected(detail::errno_code());
-            return out;
         }
     }
-    out.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    char buffer[1 << 16];
+    while (in.read(buffer, sizeof buffer) || in.gcount() > 0) {
+        out.append(buffer, static_cast<std::size_t>(in.gcount()));
+    }
     if (in.bad()) return unexpected(detail::errno_code());
     return out;
 }
 
-/// First content byte, decompressing gzip transparently. errc::empty_file when there is none.
+/// First content byte of a plain or gzip file; errc::empty_file if empty.
 [[nodiscard]] inline result<int> file_first_byte(const fs::path& p) {
 #if SHRN_HAS_ZLIB
     errno = 0;
@@ -749,7 +925,7 @@ inline std::error_code gz_error(gzFile gz) noexcept {
 
 enum class concat_mode {
     raw,         ///< byte-for-byte; gzip members concatenate into a valid multi-member stream
-    decompress,  ///< inflate gzip inputs (plain inputs pass through) into a plain output
+    decompress,  ///< decompress gzip inputs and copy plain inputs unchanged
 };
 
 /// Concatenate `inputs` into `output` (truncated first).
@@ -772,27 +948,25 @@ enum class concat_mode {
                 if (!out) return unexpected(detail::errno_code());
             }
             if (n < 0) return unexpected(detail::gz_error(gz.gz));
+            continue;
 #else
-            return unexpected(make_error_code(errc::zlib_unavailable));
+            if (file_is_gzipped(input)) return unexpected(make_error_code(errc::zlib_unavailable));
 #endif
-        } else {
-            std::ifstream in(input, std::ios::binary);
-            if (!in) return unexpected(detail::errno_code(std::errc::no_such_file_or_directory));
-            while (in.read(buffer, sizeof buffer) || in.gcount() > 0) {
-                out.write(buffer, in.gcount());
-                if (!out) return unexpected(detail::errno_code());
-            }
-            if (in.bad()) return unexpected(detail::errno_code());
         }
+        std::ifstream in(input, std::ios::binary);
+        if (!in) return unexpected(detail::errno_code(std::errc::no_such_file_or_directory));
+        while (in.read(buffer, sizeof buffer) || in.gcount() > 0) {
+            out.write(buffer, in.gcount());
+            if (!out) return unexpected(detail::errno_code());
+        }
+        if (in.bad()) return unexpected(detail::errno_code());
     }
     out.close();
     if (!out) return unexpected(detail::errno_code());
     return {};
 }
 
-// ============================================================================
 // Temporary files
-// ============================================================================
 
 /// $TMPDIR if set and non-empty, else /tmp.
 [[nodiscard]] inline fs::path temp_directory() {
@@ -813,7 +987,7 @@ enum class concat_mode {
     return fs::path(std::move(tmpl));
 }
 
-/// make_temp_file_in(temp_directory(), prefix, suffix)
+/// Create a file in temp_directory(); the caller is responsible for removal.
 [[nodiscard]] inline result<fs::path> make_temp_file(std::string_view prefix = "shrn_",
                                                      std::string_view suffix = "") {
     return make_temp_file_in(temp_directory(), prefix, suffix);
@@ -862,7 +1036,7 @@ public:
     [[nodiscard]] std::string string() const { return path_.string(); }
     explicit operator bool() const noexcept { return !path_.empty(); }
 
-    /// Delete now.
+    /// Remove the file and clear ownership; ignore cleanup errors.
     void reset() noexcept {
         if (!path_.empty()) {
             std::error_code ec;
@@ -870,7 +1044,7 @@ public:
             path_.clear();
         }
     }
-    /// Give up ownership; the file is kept.
+    /// Return the path without removing the file.
     [[nodiscard]] fs::path release() noexcept {
         fs::path p = std::move(path_);
         path_.clear();
@@ -930,9 +1104,7 @@ private:
     fs::path path_;
 };
 
-// ============================================================================
 // Process execution
-// ============================================================================
 
 /// Shell-style quoting for display only.
 [[nodiscard]] inline std::string format_command(const std::vector<std::string>& args) {
@@ -958,26 +1130,36 @@ private:
 /// Resolve `name` against PATH (or verify it directly if it contains '/').
 [[nodiscard]] inline std::optional<fs::path> which(std::string_view name) {
     if (name.empty()) return std::nullopt;
+    auto executable = [](const fs::path& p) {
+        std::error_code ec;
+        return fs::is_regular_file(p, ec) && ::access(p.c_str(), X_OK) == 0;
+    };
     if (name.find('/') != std::string_view::npos) {
         fs::path p(name);
-        if (::access(p.c_str(), X_OK) == 0) return p;
-        return std::nullopt;
+        return executable(p) ? std::optional<fs::path>(std::move(p)) : std::nullopt;
     }
     const char* path_env = std::getenv("PATH");
-    if (!path_env) return std::nullopt;
+    std::string default_path;
+    if (!path_env) {
+        auto size = ::confstr(_CS_PATH, nullptr, 0);
+        if (size == 0) return std::nullopt;
+        default_path.resize(size);
+        ::confstr(_CS_PATH, default_path.data(), size);
+        path_env = default_path.c_str();
+    }
     std::string_view path(path_env);
-    while (!path.empty()) {
+    for (;;) {
         auto sep = path.find(':');
         std::string_view dir = path.substr(0, sep);
         fs::path candidate = fs::path(dir.empty() ? std::string_view(".") : dir) / name;
-        if (::access(candidate.c_str(), X_OK) == 0) return candidate;
+        if (executable(candidate)) return candidate;
         if (sep == std::string_view::npos) break;
         path.remove_prefix(sep + 1);
     }
     return std::nullopt;
 }
 
-/// Observer for commands about to be spawned: (stage name, formatted command).
+/// Callback before starting a command: (stage name, formatted command).
 using SpawnHook = std::function<void(std::string_view stage, std::string_view cmd)>;
 
 /// Process-wide hook used when RunOptions::on_spawn is empty (e.g. a "[INFO] Running:" logger).
@@ -990,23 +1172,20 @@ struct RunOptions {
     std::optional<fs::path> workdir;              ///< chdir before exec
     bool capture_stderr = true;                   ///< collect child's stderr into RunResult
     bool inherit_stdout = true;                   ///< false → /dev/null (ignored when stdout_file set)
-    std::optional<fs::path> stdout_file;          ///< redirect stdout (created/truncated, 0644)
-    std::chrono::milliseconds timeout{0};         ///< 0 = none; on expiry the child gets SIGKILL
+    std::optional<fs::path> stdout_file;          ///< create/truncate; relative to caller, not workdir
     SpawnHook on_spawn;                           ///< overrides default_spawn_hook() for this run
 };
 
 struct RunResult {
     int exit_code = -1;        ///< WEXITSTATUS, or -1 if killed by a signal
     int signal = 0;            ///< WTERMSIG, 0 if exited normally
-    bool timed_out = false;    ///< killed by run() because RunOptions::timeout elapsed
     std::string stderr_output; ///< captured stderr (empty unless capture_stderr)
 
-    [[nodiscard]] bool success() const noexcept { return exit_code == 0 && signal == 0 && !timed_out; }
+    [[nodiscard]] bool success() const noexcept { return exit_code == 0 && signal == 0; }
 
-    /// "exited with code N" / "killed by signal N (SIGKILL ...)" / "timed out ..."
+    /// "exited with code N" / "killed by signal N (SIGKILL ...)"
     [[nodiscard]] std::string summary() const {
         if (success()) return "success";
-        if (timed_out) return "timed out; killed by signal " + std::to_string(signal);
         if (signal != 0) {
             std::string msg = "killed by signal " + std::to_string(signal);
             switch (signal) {
@@ -1023,11 +1202,45 @@ struct RunResult {
     }
 };
 
+/// Result of a bounded wait: the child was reaped, or the wait window elapsed.
+enum class wait_status {
+    ready,   ///< the child finished; its status is cached by Process::wait()
+    timeout, ///< the window elapsed with the child still running (nothing was killed)
+};
+
 namespace detail {
 
 inline bool set_cloexec(int fd) noexcept {
     int flags = ::fcntl(fd, F_GETFD);
     return flags != -1 && ::fcntl(fd, F_SETFD, flags | FD_CLOEXEC) != -1;
+}
+
+/// Create a pipe with both ends close-on-exec; use pipe2() where available.
+/// On failure `errno` describes the problem; the caller owns any opened ends.
+inline bool make_cloexec_pipe(unique_fd& r, unique_fd& w) noexcept {
+    int fds[2];
+#if defined(__linux__) && defined(_GNU_SOURCE)
+    if (::pipe2(fds, O_CLOEXEC) == 0) {
+        r = unique_fd(fds[0]);
+        w = unique_fd(fds[1]);
+        return true;
+    }
+    if (errno != ENOSYS) return false;
+#endif
+    if (::pipe(fds) == -1) return false;
+    r = unique_fd(fds[0]);
+    w = unique_fd(fds[1]);
+    return set_cloexec(r.fd) && set_cloexec(w.fd);
+}
+
+/// Move internal descriptors above 2 so dup2() cannot overwrite them
+/// when the caller has closed a standard descriptor.
+inline bool reserve_above_stdio(unique_fd& fd) noexcept {
+    if (fd.fd < 0 || fd.fd > STDERR_FILENO) return true;
+    int moved = ::fcntl(fd.fd, F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
+    if (moved == -1) return false;
+    fd = unique_fd(moved);  // closes the low descriptor
+    return true;
 }
 
 inline pid_t waitpid_retry(pid_t pid, int* status, int options) noexcept {
@@ -1038,156 +1251,442 @@ inline pid_t waitpid_retry(pid_t pid, int* status, int options) noexcept {
     return r;
 }
 
-inline int remaining_ms(std::chrono::steady_clock::time_point deadline) noexcept {
-    auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
-    return left <= 0 ? 0 : static_cast<int>(left > 0x7fffffff ? 0x7fffffff : left);
+/// Bound capture after child exit so descendants cannot delay the reader indefinitely.
+inline std::size_t pipe_capacity(int fd) noexcept {
+#ifdef F_GETPIPE_SZ
+    int sz = ::fcntl(fd, F_GETPIPE_SZ);
+    if (sz > 0) return static_cast<std::size_t>(sz);
+#endif
+    (void) fd;
+    return std::size_t{1} << 20;
 }
+
+/// Reported when a Process holds no child (default-constructed or moved from).
+inline std::error_code no_child_code() noexcept {
+    return std::make_error_code(std::errc::no_child_process);
+}
+
+inline constexpr std::chrono::milliseconds wait_poll_interval{10};
+
+/// Sleep at most `ms`; a signal may cut it short and the caller re-checks its deadline.
+inline void nap(std::chrono::milliseconds ms) noexcept {
+    if (ms.count() <= 0) return;
+    timespec ts{static_cast<time_t>(ms.count() / 1000), static_cast<long>((ms.count() % 1000) * 1'000'000L)};
+    ::nanosleep(&ts, nullptr);
+}
+
+// Stable storage for the reader. The owner reads data and errors only after join().
+struct capture_state {
+    unique_fd read_fd;             ///< stderr read end; closed by the worker when it stops
+    unique_fd wake_r;              ///< stop-signal read end (polled by the worker)
+    unique_fd wake_w;              ///< stop-signal write end (written by the owner)
+    std::string data;              ///< captured stderr
+    std::error_code error;         ///< poll/read failure
+    std::exception_ptr exception;  ///< buffer growth failure, retained for the owner
+};
+
+// wake_r remains open until join, so this write cannot raise SIGPIPE.
+inline void request_stop(capture_state& st) noexcept {
+    if (st.wake_w.fd == -1) return;
+    const char byte = 0;
+    ssize_t n;
+    do {
+        n = ::write(st.wake_w.fd, &byte, 1);
+    } while (n == -1 && errno == EINTR);
+}
+
+// Only the reader accesses read_fd, data, error, and exception while active.
+inline void capture_worker(capture_state* st) noexcept {
+    char buffer[1 << 14];
+    bool stopping = false;      ///< stop requested: take only what is already buffered
+    std::size_t budget = 0;     ///< bytes still allowed while stopping
+    try {
+        for (;;) {
+            pollfd pfds[2];
+            int nfds = 0;
+            pfds[nfds++] = pollfd{st->read_fd.fd, POLLIN, 0};
+            if (!stopping && st->wake_r.fd != -1) pfds[nfds++] = pollfd{st->wake_r.fd, POLLIN, 0};
+
+            int pr = ::poll(pfds, static_cast<nfds_t>(nfds), stopping ? 0 : -1);
+            if (pr == -1) {
+                if (errno == EINTR) continue;
+                st->error = errno_code();
+                break;
+            }
+            if (pr == 0) break;  // only possible while stopping: nothing left buffered
+            if (nfds == 2 && pfds[1].revents != 0) {
+                stopping = true;
+                budget = pipe_capacity(st->read_fd.fd);
+                continue;
+            }
+            if (pfds[0].revents == 0) continue;
+
+            ssize_t got = ::read(st->read_fd.fd, buffer, sizeof buffer);
+            if (got > 0) {
+                st->data.append(buffer, static_cast<std::size_t>(got));
+                if (stopping) {
+                    if (static_cast<std::size_t>(got) >= budget) break;
+                    budget -= static_cast<std::size_t>(got);
+                }
+                continue;
+            }
+            if (got == -1 && (errno == EINTR || errno == EAGAIN)) continue;
+            if (got == -1) {
+                st->error = errno_code();
+                break;
+            }
+            break;  // EOF: every writer closed the pipe
+        }
+    } catch (...) {
+        // Only the buffer growth above can throw; keep it for the owner.
+        st->exception = std::current_exception();
+    }
+    st->read_fd.reset();
+}
+
+/// Kill and reap the child if spawn() fails after fork().
+struct child_reaper {
+    pid_t pid;
+    explicit child_reaper(pid_t p) noexcept : pid(p) {}
+    child_reaper(const child_reaper&) = delete;
+    child_reaper& operator=(const child_reaper&) = delete;
+    ~child_reaper() {
+        if (pid > 0) {
+            ::kill(pid, SIGKILL);
+            int status;
+            waitpid_retry(pid, &status, 0);
+        }
+    }
+    void release() noexcept { pid = -1; }
+};
 
 }  // namespace detail
 
-/**
- * Fork/exec `args` (PATH search, environment inherited) and wait.
- *
- * The error path covers failures to *launch* (pipe/fork/chdir/exec errno).
- * A child that runs and fails is a successful `run()` with `!result->success()`.
- * `stage` is only forwarded to the spawn hook.
- */
-[[nodiscard]] inline result<RunResult> run(const std::vector<std::string>& args,
+class Process;
+
+/// Start a child and return after the exec handshake, without waiting for completion.
+[[nodiscard]] inline result<Process> spawn(const std::vector<std::string>& args,
                                            const RunOptions& opts = {},
-                                           std::string_view stage = {}) {
+                                           std::string_view stage = {});
+
+/// Move-only child owner. Methods are not concurrently callable.
+/// Destruction waits for the child and joins the optional stderr reader.
+class Process {
+public:
+    Process() = default;
+
+    Process(Process&& o) noexcept
+        : pid_(o.pid_),
+          status_(o.status_),
+          reaped_(o.reaped_),
+          cap_(std::move(o.cap_)),
+          reader_(std::move(o.reader_)),
+          result_(std::move(o.result_)),
+          exception_(std::move(o.exception_)),
+          finished_(o.finished_) {
+        o.pid_ = -1;
+        o.reaped_ = false;
+        o.finished_ = false;
+    }
+
+    Process& operator=(Process&& o) noexcept {
+        if (this != &o) {
+            teardown();
+            pid_ = o.pid_;
+            status_ = o.status_;
+            reaped_ = o.reaped_;
+            cap_ = std::move(o.cap_);
+            reader_ = std::move(o.reader_);
+            result_ = std::move(o.result_);
+            exception_ = std::move(o.exception_);
+            finished_ = o.finished_;
+            o.pid_ = -1;
+            o.reaped_ = false;
+            o.finished_ = false;
+        }
+        return *this;
+    }
+
+    Process(const Process&) = delete;
+    Process& operator=(const Process&) = delete;
+
+    ~Process() { teardown(); }
+
+    /// Poll child exit without joining the capture reader.
+    [[nodiscard]] result<bool> running() {
+        if (finished_) {
+            if (!result_) return unexpected(result_.error());
+            return false;
+        }
+        if (reaped_) return false;
+        if (pid_ <= 0) return unexpected(detail::no_child_code());
+        int status = 0;
+        pid_t r = detail::waitpid_retry(pid_, &status, WNOHANG);
+        if (r == -1) {
+            fail(detail::errno_code());
+            return unexpected(result_.error());
+        }
+        if (r == 0) return true;
+        status_ = status;
+        reaped_ = true;
+        pid_ = -1;
+        return false;
+    }
+
+    /// Wait without killing on expiry; nonpositive durations only poll.
+    [[nodiscard]] result<wait_status> wait_for(std::chrono::milliseconds budget) {
+        if (finished_) {
+            auto& completed = wait();
+            if (!completed) return unexpected(completed.error());
+            return wait_status::ready;
+        }
+        if (pid_ <= 0 && !reaped_) return unexpected(detail::no_child_code());
+        const auto start = std::chrono::steady_clock::now();
+        for (;;) {
+            auto alive = running();
+            if (!alive) return unexpected(alive.error());
+            if (!*alive) {
+                auto& r = wait();  // reaped already: finalizes the capture
+                if (!r) return unexpected(r.error());
+                return wait_status::ready;
+            }
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start);
+            if (budget <= elapsed) return wait_status::timeout;
+            const auto left = budget - elapsed;
+            detail::nap(left < detail::wait_poll_interval ? left : detail::wait_poll_interval);
+        }
+    }
+
+    /// Wait and collect captured stderr; later calls return the cached result.
+    result<RunResult>& wait() {
+        if (!finished_) {
+            if (!reaped_) {
+                if (pid_ <= 0) fail(detail::no_child_code());
+                else {
+                    int status = 0;
+                    if (detail::waitpid_retry(pid_, &status, 0) == -1) fail(detail::errno_code());
+                    else {
+                        status_ = status;
+                        reaped_ = true;
+                        pid_ = -1;
+                    }
+                }
+            }
+            if (!finished_) finalize();
+        }
+        if (cap_) {
+            std::string discarded;
+            collect_capture(discarded);
+        }
+        if (exception_) std::rethrow_exception(exception_);
+        return result_;
+    }
+
+    /// SIGKILL and reap the direct child; descendants are not signalled.
+    result<void> terminate() {
+        if (!finished_ && pid_ <= 0 && !reaped_) return unexpected(detail::no_child_code());
+        std::error_code kill_ec;
+        if (pid_ > 0 && ::kill(pid_, SIGKILL) == -1 && errno != ESRCH) kill_ec = detail::errno_code();
+        auto& r = wait();
+        if (kill_ec) return unexpected(kill_ec);
+        if (!r) return unexpected(r.error());
+        return {};
+    }
+
+
+private:
+    Process(pid_t pid, std::unique_ptr<detail::capture_state> cap, std::thread reader) noexcept
+        : pid_(pid), cap_(std::move(cap)), reader_(std::move(reader)) {}
+
+    friend result<Process> spawn(const std::vector<std::string>&, const RunOptions&, std::string_view);
+
+    // Joining precedes access to the reader's state.
+    void stop_and_join() noexcept {
+        if (!reader_.joinable()) return;
+        detail::request_stop(*cap_);
+        reader_.join();
+    }
+
+    /// Hand the worker's buffer over after joining; report its failure, if any.
+    std::error_code collect_capture(std::string& out) noexcept {
+        stop_and_join();
+        std::error_code ec;
+        if (cap_) {
+            ec = cap_->error;
+            exception_ = cap_->exception;
+            out = std::move(cap_->data);
+            cap_.reset();
+        }
+        return ec;
+    }
+
+    /// Turn the reaped status plus the captured stderr into the cached result.
+    void finalize() {
+        RunResult res;
+        if (WIFEXITED(status_)) {
+            res.exit_code = WEXITSTATUS(status_);
+        } else if (WIFSIGNALED(status_)) {
+            res.signal = WTERMSIG(status_);
+        }
+        std::error_code ec = collect_capture(res.stderr_output);
+        finished_ = true;
+        if (ec) result_ = unexpected(ec);
+        else result_ = std::move(res);
+    }
+
+    // Cache a waitpid error; wait() or destruction will join the reader.
+    void fail(std::error_code ec) {
+        pid_ = -1;
+        finished_ = true;
+        result_ = unexpected(ec);
+    }
+
+    // Destruction and move assignment wait without reporting errors.
+    void teardown() noexcept {
+        if (pid_ > 0) {
+            int status = 0;
+            detail::waitpid_retry(pid_, &status, 0);
+            pid_ = -1;
+        }
+        stop_and_join();
+        cap_.reset();
+    }
+
+    pid_t pid_ = -1;                                ///< > 0 while the child is unreaped
+    int status_ = 0;                                ///< waitpid() status, valid once reaped_
+    bool reaped_ = false;                           ///< child collected, capture not yet finalized
+    std::unique_ptr<detail::capture_state> cap_;
+    std::thread reader_;                            ///< joinable iff cap_ is set
+    result<RunResult> result_;                      ///< valid once finished_
+    std::exception_ptr exception_;
+    bool finished_ = false;
+};
+
+inline result<Process> spawn(const std::vector<std::string>& args, const RunOptions& opts, std::string_view stage) {
     if (args.empty()) return unexpected(make_error_code(errc::empty_command));
     if (opts.on_spawn) opts.on_spawn(stage, format_command(args));
     else if (const auto& hook = default_spawn_hook()) hook(stage, format_command(args));
 
     // Exec-status pipe: CLOEXEC, so a successful exec closes it (EOF); a failure writes errno.
-    int raw[2];
-    if (::pipe(raw) == -1) return unexpected(detail::errno_code());
-    detail::unique_fd err_r(raw[0]), err_w(raw[1]);
-    if (!detail::set_cloexec(err_r.fd) || !detail::set_cloexec(err_w.fd)) return unexpected(detail::errno_code());
+    detail::unique_fd exec_r, exec_w;
+    if (!detail::make_cloexec_pipe(exec_r, exec_w)) return unexpected(detail::errno_code());
 
-    detail::unique_fd stderr_r, stderr_w;
+    // Allocate capture storage and close-on-exec pipes before fork.
+    std::unique_ptr<detail::capture_state> cap;
+    detail::unique_fd stderr_w;
     if (opts.capture_stderr) {
-        if (::pipe(raw) == -1) return unexpected(detail::errno_code());
-        stderr_r = detail::unique_fd(raw[0]);
-        stderr_w = detail::unique_fd(raw[1]);
-        detail::set_cloexec(stderr_r.fd);
+        cap = std::make_unique<detail::capture_state>();
+        if (!detail::make_cloexec_pipe(cap->read_fd, stderr_w)) return unexpected(detail::errno_code());
+        if (!detail::make_cloexec_pipe(cap->wake_r, cap->wake_w)) return unexpected(detail::errno_code());
     }
 
     detail::unique_fd stdout_fd;
     if (opts.stdout_file) {
-        stdout_fd = detail::unique_fd(::open(opts.stdout_file->c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644));
+        stdout_fd = detail::unique_fd(::open(opts.stdout_file->c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644));
         if (!stdout_fd) return unexpected(detail::errno_code());
     } else if (!opts.inherit_stdout) {
-        stdout_fd = detail::unique_fd(::open("/dev/null", O_WRONLY));
+        stdout_fd = detail::unique_fd(::open("/dev/null", O_WRONLY | O_CLOEXEC));
         if (!stdout_fd) return unexpected(detail::errno_code());
     }
 
-    // Build argv before fork: no allocation in the child.
+    if (!detail::reserve_above_stdio(exec_r) || !detail::reserve_above_stdio(exec_w) ||
+        !detail::reserve_above_stdio(stderr_w) || !detail::reserve_above_stdio(stdout_fd))
+        return unexpected(detail::errno_code());
+    if (cap && (!detail::reserve_above_stdio(cap->read_fd) || !detail::reserve_above_stdio(cap->wake_r) ||
+                !detail::reserve_above_stdio(cap->wake_w)))
+        return unexpected(detail::errno_code());
+
+    // Prepare argv before fork to avoid allocating in the child.
     std::vector<char*> argv;
     argv.reserve(args.size() + 1);
     for (const auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
     argv.push_back(nullptr);
     const char* workdir = opts.workdir ? opts.workdir->c_str() : nullptr;
+    const int exec_wfd = exec_w.fd;
+    const int stderr_wfd = stderr_w.fd;
+    const int stdout_wfd = stdout_fd.fd;
 
     pid_t pid = ::fork();
     if (pid == -1) return unexpected(detail::errno_code());
 
     if (pid == 0) {
-        auto fail = [&](int e) {
-            ssize_t ignored = ::write(err_w.fd, &e, sizeof e);
-            (void) ignored;
+        // Async-signal-safe only: no allocation, no locks, straight to exec.
+        auto fail = [exec_wfd](int e) {
+            ssize_t written;
+            do {
+                written = ::write(exec_wfd, &e, sizeof e);
+            } while (written == -1 && errno == EINTR);
             ::_exit(127);
         };
         if (workdir && ::chdir(workdir) == -1) fail(errno);
-        if (stderr_w && ::dup2(stderr_w.fd, STDERR_FILENO) == -1) fail(errno);
-        if (stdout_fd && ::dup2(stdout_fd.fd, STDOUT_FILENO) == -1) fail(errno);
+        // Internal descriptors are above 2, separate from the dup2() destinations.
+        if (stderr_wfd != -1) {
+            if (::dup2(stderr_wfd, STDERR_FILENO) == -1) fail(errno);
+            ::close(stderr_wfd);
+        }
+        if (stdout_wfd != -1) {
+            if (::dup2(stdout_wfd, STDOUT_FILENO) == -1) fail(errno);
+            ::close(stdout_wfd);
+        }
         ::execvp(argv[0], argv.data());
         fail(errno);
     }
 
     // Parent.
-    err_w.reset();
+    detail::child_reaper reaper(pid);
+    exec_w.reset();
     stderr_w.reset();
     stdout_fd.reset();
 
     int child_errno = 0;
-    ssize_t n;
-    do {
-        n = ::read(err_r.fd, &child_errno, sizeof child_errno);
-    } while (n == -1 && errno == EINTR);
-    err_r.reset();
-    if (n == static_cast<ssize_t>(sizeof child_errno)) {
-        int status;
-        detail::waitpid_retry(pid, &status, 0);
-        return unexpected(std::error_code(child_errno, std::generic_category()));
-    }
-
-    RunResult res;
-    const bool has_deadline = opts.timeout.count() > 0;
-    const auto deadline = std::chrono::steady_clock::now() + opts.timeout;
-    bool killed = false;
-    auto kill_child = [&] {
-        if (!killed) {
-            ::kill(pid, SIGKILL);
-            killed = true;
-        }
-    };
-
-    if (stderr_r) {
-        char buffer[1 << 14];
-        pollfd pfd{stderr_r.fd, POLLIN, 0};
+    {
+        char buf[sizeof(int)];
+        std::size_t have = 0;
         for (;;) {
-            int timeout_ms = has_deadline ? detail::remaining_ms(deadline) : -1;
-            if (has_deadline && timeout_ms == 0 && !killed) kill_child();
-            int pr = ::poll(&pfd, 1, killed ? -1 : timeout_ms);
-            if (pr == -1) {
+            ssize_t n = ::read(exec_r.fd, buf + have, sizeof buf - have);
+            if (n == -1) {
                 if (errno == EINTR) continue;
-                break;
+                return unexpected(detail::errno_code());
             }
-            if (pr == 0) {
-                kill_child();
-                continue;
-            }
-            ssize_t got = ::read(stderr_r.fd, buffer, sizeof buffer);
-            if (got > 0) {
-                res.stderr_output.append(buffer, static_cast<std::size_t>(got));
-                continue;
-            }
-            if (got == -1 && errno == EINTR) continue;
-            break;  // EOF or error
+            if (n == 0) break;  // EOF: exec succeeded
+            have += static_cast<std::size_t>(n);
+            if (have == sizeof buf) break;
         }
-        stderr_r.reset();
-    } else if (has_deadline) {
-        // Nothing to drain: watch the child's state (without reaping) until it exits or the deadline passes.
-        siginfo_t info;
-        for (;;) {
-            info.si_pid = 0;
-            int r = ::waitid(P_PID, static_cast<id_t>(pid), &info, WEXITED | WNOHANG | WNOWAIT);
-            if (r == -1 && errno == EINTR) continue;
-            if (r == -1 || info.si_pid == pid) break;  // error, or exited (reaped below)
-            if (detail::remaining_ms(deadline) == 0) {
-                kill_child();
-                break;
-            }
-            timespec ts{0, 5'000'000};  // 5 ms
-            ::nanosleep(&ts, nullptr);
+        exec_r.reset();
+        if (have != 0 && have != sizeof buf)
+            return unexpected(std::make_error_code(std::errc::io_error));
+        if (have == sizeof buf) std::memcpy(&child_errno, buf, sizeof child_errno);
+    }
+    if (child_errno != 0) return unexpected(std::error_code(child_errno, std::generic_category()));
+
+    std::thread reader;
+    if (cap) {
+        try {
+            reader = std::thread(detail::capture_worker, cap.get());
+        } catch (const std::system_error& e) {
+            cap->read_fd.reset();
+            return unexpected(e.code());
+        } catch (...) {
+            cap->read_fd.reset();
+            throw;
         }
     }
 
-    int status;
-    if (detail::waitpid_retry(pid, &status, 0) == -1) return unexpected(detail::errno_code());
-    if (WIFEXITED(status)) {
-        res.exit_code = WEXITSTATUS(status);
-    } else if (WIFSIGNALED(status)) {
-        res.signal = WTERMSIG(status);
-    }
-    res.timed_out = killed;
-    return res;
+    reaper.release();  // the Process owns the child from here on
+    return Process(pid, std::move(cap), std::move(reader));
 }
 
-// ============================================================================
-// Outcome: a stage as a timeline of checks and commands
-// ============================================================================
+/// Synchronous convenience: spawn() followed by wait().
+[[nodiscard]] inline result<RunResult> run(const std::vector<std::string>& args,
+                                           const RunOptions& opts = {},
+                                           std::string_view stage = {}) {
+    auto proc = spawn(args, opts, stage);
+    if (!proc) return unexpected(proc.error());
+    return std::move(proc->wait());
+}
+
+// Outcome: ordered checks and commands
 
 enum class Expect : unsigned {
     EXISTS    = 0,       ///< readable regular file (always checked)
@@ -1202,97 +1701,201 @@ enum class Expect : unsigned {
     return (static_cast<unsigned>(flags) & static_cast<unsigned>(flag)) != 0;
 }
 
-/**
- * A stage: checks and commands in the order they happen. The first failure
- * short-circuits everything after it (later commands are not spawned), so
- * `detail()` names the earliest problem. Once a command has run, details are
- * prefixed with its argv[0].
- *
- *   stage("minimap2 alignment")
- *       .expect_which("minimap2")                       // pre-run
- *       .expect_file(ref, Expect::NON_EMPTY)
- *       .expect_file(reads, is_fastq, "FASTQ")
- *       .proc({"minimap2", "-x", "map-ont", ref, reads}, opts)
- *       .expect_file(paf, Expect::NON_EMPTY)           // post-run
- *       .or_die_if(!soft_fail)                         // reports under the stage name
- *       .or_execute([&] { recover(); });
- */
+/// Ordered asynchronous commands and checks; skip later operations after failure.
 class Outcome {
 public:
     Outcome() = default;
     explicit Outcome(std::string name) noexcept : name_(std::move(name)) {}
+    Outcome(const Outcome&) = delete;
+    Outcome& operator=(const Outcome&) = delete;
+    Outcome(Outcome&&) noexcept = default;
+    Outcome& operator=(Outcome&&) noexcept = default;
 
-    /// Spawn `args` unless the stage already failed; merges exit status and stderr.
-    Outcome& proc(const std::vector<std::string>& args, const RunOptions& opts = {}) {
+    /// Wait for the previous command, then start args without waiting for completion.
+    Outcome& proc(const std::vector<std::string>& args, const RunOptions& opts = {}) & {
         if (!ok()) return *this;
         cmd_ = args.empty() ? std::string() : args.front();
-        auto r = run(args, opts, name_);
-        if (!r) return fail("cannot execute: " + r.error().message());
-        stderr_ = std::move(r->stderr_output);
-        if (!r->success()) return fail(r->summary());
+        auto child = spawn(args, opts, name_);
+        if (!child) fail("cannot execute: " + child.error().message());
+        else pending_.emplace(std::move(*child));
         return *this;
     }
+    Outcome&& proc(const std::vector<std::string>& args, const RunOptions& opts = {}) && {
+        return std::move(proc(args, opts));
+    }
 
-    /// Merge the exit code of an in-process subprogram (0 = success).
-    Outcome& expect_success(int exit_code) {
+    /// Wait for the previous command, then invoke on the caller's thread.
+    template <class F, class... Args>
+        requires std::is_invocable_r_v<int, F, Args...>
+    Outcome& call(F&& fn, Args&&... args) & {
+        if (!ok()) return *this;
+        cmd_.clear();
+        int status = std::invoke(std::forward<F>(fn), std::forward<Args>(args)...);
+        if (status != 0) fail("function returned code " + std::to_string(status));
+        return *this;
+    }
+    template <class F, class... Args>
+        requires std::is_invocable_r_v<int, F, Args...>
+    Outcome&& call(F&& fn, Args&&... args) && {
+        return std::move(call(std::forward<F>(fn), std::forward<Args>(args)...));
+    }
+
+    /// Join all prerequisites, preserving the first failure in argument order.
+    template <class... Stages>
+        requires (std::is_same_v<Stages, Outcome> && ...)
+    Outcome& after(const Stages&... prerequisites) & {
+        finish();
+        (prerequisites.finish(), ...);
+        auto check = [this](const Outcome& prerequisite) {
+            if (code_ != 0 || prerequisite.code_ == 0) return;
+            const auto& label = prerequisite.name_.empty() ? prerequisite.cmd_ : prerequisite.name_;
+            fail("prerequisite " + (label.empty() ? std::string("(anonymous)") : label) +
+                 " failed: " + prerequisite.detail_);
+        };
+        (check(prerequisites), ...);
+        return *this;
+    }
+    template <class... Stages>
+        requires (std::is_same_v<Stages, Outcome> && ...)
+    Outcome&& after(const Stages&... prerequisites) && {
+        return std::move(after(prerequisites...));
+    }
+
+    /// Wait without a deadline, including after a failed expectation.
+    Outcome& wait() & {
+        finish();
+        return *this;
+    }
+    Outcome&& wait() && { return std::move(wait()); }
+
+    /// Expiry leaves the child running and does not record failure.
+    [[nodiscard]] wait_status wait_for(std::chrono::milliseconds duration) {
+        if (!pending_) return wait_status::ready;
+        auto status = pending_->wait_for(duration);
+        if (!status) {
+            fail("cannot wait: " + status.error().message());
+            finish();
+            return wait_status::ready;
+        }
+        if (*status == wait_status::ready) finish();
+        return *status;
+    }
+
+    /// Check child status without waiting or collecting captured output.
+    [[nodiscard]] bool running() const {
+        if (!pending_) return false;
+        auto active = pending_->running();
+        if (!active) {
+            fail("cannot wait: " + active.error().message());
+            return false;
+        }
+        return *active;
+    }
+
+    /// Record failure on expiry; use or_terminate() to stop the child.
+    Outcome& expect_done_within(std::chrono::milliseconds duration) & {
+        if (code_ == 0 && wait_for(duration) == wait_status::timeout)
+            fail("did not finish within " + std::to_string(duration.count()) + " ms");
+        return *this;
+    }
+    Outcome&& expect_done_within(std::chrono::milliseconds duration) && {
+        return std::move(expect_done_within(duration));
+    }
+
+    /// Kill and reap this stage's child on recorded failure, without waiting first.
+    Outcome& or_terminate() & {
+        if (code_ != 0) terminate_pending();
+        return *this;
+    }
+    Outcome&& or_terminate() && { return std::move(or_terminate()); }
+
+    Outcome& expect_success(int exit_code) & {
         if (ok() && exit_code != 0) fail("exited with code " + std::to_string(exit_code));
         return *this;
     }
+    Outcome&& expect_success(int exit_code) && { return std::move(expect_success(exit_code)); }
 
-    /// Fail with "executable not found: <name>" unless which(name) resolves.
-    Outcome& expect_which(std::string_view name) {
+    Outcome& expect_which(std::string_view name) & {
         if (ok() && !which(name)) fail("executable not found: " + std::string(name));
         return *this;
     }
+    Outcome&& expect_which(std::string_view name) && { return std::move(expect_which(name)); }
 
-    Outcome& with_error(std::string detail) {
+    /// Replace the detail text without changing the success/failure state.
+    Outcome& with_error(std::string detail) & {
+        if (code_ == 0) finish();
         detail_ = std::move(detail);
         return *this;
     }
-    Outcome& with_stderr(std::string captured) {
+    Outcome&& with_error(std::string detail) && { return std::move(with_error(std::move(detail))); }
+
+    Outcome& with_stderr(std::string captured) & {
+        if (code_ == 0) finish();
         stderr_ = std::move(captured);
         return *this;
     }
+    Outcome&& with_stderr(std::string captured) && { return std::move(with_stderr(std::move(captured))); }
 
-    /// Fail unless `cond`; `detail` is recorded verbatim.
-    Outcome& expect(bool cond, std::string_view detail) {
+    /// The bool argument is evaluated before the call; use a callable to defer it.
+    Outcome& expect(bool cond, std::string_view detail) & {
         if (ok() && !cond) fail(std::string(detail));
         return *this;
     }
-
-    Outcome& expect_file(const fs::path& p, Expect flags = Expect::EXISTS) {
-        if (!ok()) return *this;
-        if (!file_readable(p)) return fail("missing: " + p.string());
-        if (has_flag(flags, Expect::NON_EMPTY) && !file_non_empty(p)) return fail("empty: " + p.string());
-        if (has_flag(flags, Expect::GZIPPED) && !file_is_gzipped(p)) return fail("not gzipped: " + p.string());
-        return *this;
+    Outcome&& expect(bool cond, std::string_view detail) && {
+        return std::move(expect(cond, detail));
     }
 
-    /// Fail with "not <what>: <path>" unless the file is readable and `pred(p)` holds.
+    template <class Pred>
+        requires std::is_invocable_r_v<bool, Pred>
+    Outcome& expect(Pred&& pred, std::string_view detail) & {
+        if (ok() && !std::invoke(std::forward<Pred>(pred))) fail(std::string(detail));
+        return *this;
+    }
+    template <class Pred>
+        requires std::is_invocable_r_v<bool, Pred>
+    Outcome&& expect(Pred&& pred, std::string_view detail) && {
+        return std::move(expect(std::forward<Pred>(pred), detail));
+    }
+
+    Outcome& expect_file(const fs::path& p, Expect flags = Expect::EXISTS) & {
+        if (!ok()) return *this;
+        if (!file_readable(p)) fail("missing: " + p.string());
+        else if (has_flag(flags, Expect::NON_EMPTY) && !file_non_empty(p)) fail("empty: " + p.string());
+        else if (has_flag(flags, Expect::GZIPPED) && !file_is_gzipped(p)) fail("not gzipped: " + p.string());
+        return *this;
+    }
+    Outcome&& expect_file(const fs::path& p, Expect flags = Expect::EXISTS) && {
+        return std::move(expect_file(p, flags));
+    }
+
     template <class Pred>
         requires std::is_invocable_r_v<bool, Pred, const fs::path&>
-    Outcome& expect_file(const fs::path& p, Pred&& pred, std::string_view what) {
+    Outcome& expect_file(const fs::path& p, Pred&& pred, std::string_view what) & {
         if (!ok()) return *this;
-        if (!file_readable(p)) return fail("missing: " + p.string());
-        if (!std::invoke(std::forward<Pred>(pred), p)) return fail("not " + std::string(what) + ": " + p.string());
+        if (!file_readable(p)) fail("missing: " + p.string());
+        else if (!std::invoke(std::forward<Pred>(pred), p)) fail("not " + std::string(what) + ": " + p.string());
         return *this;
     }
+    template <class Pred>
+        requires std::is_invocable_r_v<bool, Pred, const fs::path&>
+    Outcome&& expect_file(const fs::path& p, Pred&& pred, std::string_view what) && {
+        return std::move(expect_file(p, std::forward<Pred>(pred), what));
+    }
 
-    /// Run `fn()` on failure; chain continues.
     template <class F>
         requires std::is_invocable_v<F>
-    Outcome& or_execute(F&& fn) {
+    Outcome& or_execute(F&& fn) & {
         if (!ok()) std::invoke(std::forward<F>(fn));
         return *this;
     }
+    template <class F>
+        requires std::is_invocable_v<F>
+    Outcome&& or_execute(F&& fn) && { return std::move(or_execute(std::forward<F>(fn))); }
 
-    /**
-     * On failure: report to stderr, then exit(EXIT_FAILURE) if `condition`,
-     * otherwise warn that soft-fail is active and continue the chain.
-     * `stage` defaults to the stage name, then the last command, then "command".
-     */
-    Outcome& or_die_if(bool condition, std::string_view stage = {}) {
+    /// On fatal failure, reap this stage's child before exiting the caller.
+    Outcome& or_die_if(bool condition, std::string_view stage = {}) & {
         if (ok()) return *this;
+        if (condition) terminate_pending();
         if (stage.empty()) stage = !name_.empty() ? name_ : !cmd_.empty() ? cmd_ : std::string_view("command");
         if (condition) {
             std::fprintf(stderr, "\n[ERROR] %.*s failed", static_cast<int>(stage.size()), stage.data());
@@ -1307,26 +1910,61 @@ public:
         std::fprintf(stderr, " — soft-fail active\n");
         return *this;
     }
-
-    [[nodiscard]] bool ok() const noexcept { return code_ == 0; }
-    explicit operator bool() const noexcept { return ok(); }
-    [[nodiscard]] int code() const noexcept { return code_; }
-    [[nodiscard]] const std::string& name() const noexcept { return name_; }
-    [[nodiscard]] const std::string& detail() const noexcept { return detail_; }
-    [[nodiscard]] const std::string& stderr_output() const noexcept { return stderr_; }
-
-private:
-    Outcome& fail(std::string detail) {
-        code_ = EXIT_FAILURE;
-        detail_ = cmd_.empty() ? std::move(detail) : cmd_ + ": " + detail;
-        return *this;
+    Outcome&& or_die_if(bool condition, std::string_view stage = {}) && {
+        return std::move(or_die_if(condition, stage));
     }
 
-    int code_ = 0;
+    /// Final-result access waits unless a failure has already been recorded.
+    [[nodiscard]] bool ok() const {
+        if (code_ == 0) finish();
+        return code_ == 0;
+    }
+    explicit operator bool() const { return ok(); }
+    [[nodiscard]] int code() const {
+        if (code_ == 0) finish();
+        return code_;
+    }
+    [[nodiscard]] const std::string& name() const noexcept { return name_; }
+    [[nodiscard]] const std::string& detail() const {
+        if (code_ == 0) finish();
+        return detail_;
+    }
+    [[nodiscard]] const std::string& stderr_output() const {
+        if (code_ == 0) finish();
+        return stderr_;
+    }
+
+private:
+    void fail(std::string detail) const {
+        if (code_ != 0) return;
+        code_ = EXIT_FAILURE;
+        detail_ = cmd_.empty() ? std::move(detail) : cmd_ + ": " + detail;
+    }
+
+    void finish() const {
+        if (!pending_) return;
+        auto& completed = pending_->wait();
+        if (!completed) fail("cannot wait: " + completed.error().message());
+        else {
+            stderr_ = std::move(completed->stderr_output);
+            if (!completed->success()) fail(completed->summary());
+        }
+        pending_.reset();
+    }
+
+    void terminate_pending() {
+        if (!pending_) return;
+        auto stopped = pending_->terminate();
+        if (!stopped) detail_ += "; cannot terminate: " + stopped.error().message();
+        finish();
+    }
+
+    mutable int code_ = 0;
     std::string name_;
-    std::string cmd_;  ///< argv[0] of the most recent proc; prefixes later details
-    std::string detail_;
-    std::string stderr_;
+    std::string cmd_;
+    mutable std::string detail_;
+    mutable std::string stderr_;
+    mutable std::optional<Process> pending_;
 };
 
 /// Start a named stage.
@@ -1336,7 +1974,9 @@ private:
 
 /// Anonymous single-command stage: proc(args, opts) == Outcome().proc(args, opts).
 [[nodiscard]] inline Outcome proc(const std::vector<std::string>& args, const RunOptions& opts = {}) {
-    return Outcome().proc(args, opts);
+    Outcome outcome;
+    outcome.proc(args, opts);
+    return outcome;
 }
 
 }  // namespace shrn

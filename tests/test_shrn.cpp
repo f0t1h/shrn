@@ -1,13 +1,12 @@
-/**
- * @file test_shrn.cpp
- * @brief Behavioral tests for shrn. Built twice: native std::expected and forced polyfill.
- */
+// Tests for std::expected and the fallback implementation.
 
 #include <shrn.hpp>
 
 #include <chrono>
 #include <cstdio>
 #include <fstream>
+#include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -39,11 +38,214 @@ static void write_gz(const fs::path& p, const std::string& content) {
 }
 #endif
 
-// ---------------------------------------------------------------------------
+// Run this binary with --helper=<mode> [arg] to test child-process behavior
+// without depending on an external script.
+static fs::path g_self_exe;
+
+static void init_self_exe(const char* argv0) {
+    char buf[4096];
+    ssize_t n = ::readlink("/proc/self/exe", buf, sizeof buf - 1);
+    if (n > 0) {
+        buf[n] = '\0';
+        g_self_exe = fs::path(buf);
+        return;
+    }
+    if (auto found = shrn::which(argv0)) g_self_exe = *found;
+    else g_self_exe = fs::absolute(argv0);
+}
+
+static void helper_write(int fd, const char* data, std::size_t n) {
+    while (n > 0) {
+        ssize_t w = ::write(fd, data, n);
+        if (w <= 0) {
+            if (w == -1 && errno == EINTR) continue;
+            return;
+        }
+        data += w;
+        n -= static_cast<std::size_t>(w);
+    }
+}
+
+static void helper_sleep_ms(long ms) {
+    timespec ts{ms / 1000, (ms % 1000) * 1'000'000L};
+    while (::nanosleep(&ts, &ts) == -1 && errno == EINTR) {
+    }
+}
+
+// Bound helper sleeps to keep failure cases short.
+static long helper_bounded_ms(const char* text) {
+    long ms = std::strtol(text, nullptr, 10);
+    if (ms < 0) ms = 0;
+    return ms > 5000 ? 5000 : ms;
+}
+
+// Publish via rename so the parent never reads a half-written marker.
+static void helper_publish(const fs::path& p, const std::string& content) {
+    fs::path tmp = p;
+    tmp += ".tmp";
+    write_file(tmp, content);
+    std::error_code ec;
+    fs::rename(tmp, p, ec);
+}
+
+static int helper_main(const std::string& mode, const char* arg, const char* arg2) {
+    if (mode == "emit") {  // write both streams and exit with code 7
+        helper_write(STDOUT_FILENO, "OUT\n", 4);
+        helper_write(STDERR_FILENO, "ERR\n", 4);
+        return 7;
+    }
+    if (mode == "emit-bytes") {  // arg = byte count written to stderr, then exit
+        if (*arg2) helper_publish(std::string(arg2) + ".pid", std::to_string(::getpid()));
+        std::size_t n = static_cast<std::size_t>(std::strtoul(arg, nullptr, 10));
+        std::vector<char> buf(n, 'x');
+        helper_write(STDERR_FILENO, buf.data(), n);
+        return 0;
+    }
+    if (mode == "emit-out-bytes") {  // arg = byte count written to stdout, then exit
+        std::size_t n = static_cast<std::size_t>(std::strtoul(arg, nullptr, 10));
+        std::vector<char> buf(n, 'o');
+        helper_write(STDOUT_FILENO, buf.data(), n);
+        return 0;
+    }
+    if (mode == "close-stderr-sleep") {  // arg = ms to stay alive after closing stderr
+        ::close(STDERR_FILENO);
+        helper_sleep_ms(helper_bounded_ms(arg));
+        return 0;
+    }
+    if (mode == "orphan-stderr") {  // arg = ms a grandchild keeps the stderr pipe open
+        pid_t grandchild = ::fork();
+        if (grandchild == 0) {
+            ::close(STDOUT_FILENO);
+            helper_sleep_ms(helper_bounded_ms(arg));
+            ::_exit(0);
+        }
+        if (grandchild == -1) return 98;
+        helper_write(STDERR_FILENO, "direct\n", 7);
+        return 0;  // exits immediately; the grandchild still holds fd 2
+    }
+    if (mode == "pid-sleep-touch") {  // arg = base path, arg2 = ms
+        std::string base(arg);        // publishes <base>.pid at once, <base>.late only if it finishes
+        helper_publish(base + ".pid", std::to_string(::getpid()));
+        helper_sleep_ms(helper_bounded_ms(arg2));
+        helper_publish(base + ".late", "done\n");
+        return 0;
+    }
+    if (mode == "sleep-then-write") {  // arg = path, arg2 = ms: append "first" only at the end
+        helper_sleep_ms(helper_bounded_ms(arg2));
+        int fd = ::open(arg, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd == -1) return 31;
+        helper_write(fd, "first", 5);
+        ::close(fd);
+        return 0;
+    }
+    if (mode == "rendezvous") {  // arg = own marker, arg2 = peer marker
+        helper_publish(arg, std::to_string(::getpid()));
+        for (int waited = 0; waited < 4000; waited += 20) {
+            if (fs::exists(arg2)) return 0;  // the peer was started before this child was awaited
+            helper_sleep_ms(20);
+        }
+        return 21;  // peer never appeared: the two launches were not concurrent
+    }
+    if (mode == "open-fds") {  // report inherited descriptors above 2
+        for (int fd = 3; fd < 256; ++fd) {
+            if (::fcntl(fd, F_GETFD) == -1) continue;
+            char line[32];
+            int len = std::snprintf(line, sizeof line, "fd=%d\n", fd);
+            helper_write(STDERR_FILENO, line, static_cast<std::size_t>(len));
+        }
+        return 0;
+    }
+    if (mode == "closed-stdio") {  // arg = temporary directory; close 0/1/2 before run()
+        fs::path dir(arg);
+        ::close(STDIN_FILENO);
+        ::close(STDOUT_FILENO);
+        ::close(STDERR_FILENO);
+        shrn::RunOptions o;
+        o.stdout_file = dir / "closed_stdio.out";  // forces a dup2 onto fd 1
+        auto r = shrn::run({g_self_exe.string(), "--helper=emit"}, o);
+        if (!r) return 11;
+        if (r->exit_code != 7) return 12;
+        if (r->stderr_output != "ERR\n") return 13;
+        if (shrn::read_file(*o.stdout_file).value_or(std::string()) != "OUT\n") return 14;
+        // Launch errors must reach the status pipe, not the redirected stdout file.
+        auto bad = shrn::run({"shrn-definitely-not-a-command"}, o);
+        if (bad || bad.error() != std::errc::no_such_file_or_directory) return 15;
+        return 0;
+    }
+    return 99;
+}
+
+// Poll until `pred` holds; bounded so a broken implementation fails instead of hanging.
+template <class Pred> static bool wait_until(Pred pred, std::chrono::milliseconds bound = 5000ms) {
+    auto deadline = std::chrono::steady_clock::now() + bound;
+    for (;;) {
+        if (pred()) return true;
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        helper_sleep_ms(10);
+    }
+}
+
+// Wait for the start marker of a pid-sleep-touch helper, then read its pid.
+static std::optional<pid_t> child_pid(const std::string& base) {
+    if (!wait_until([&] { return fs::exists(base + ".pid"); })) return std::nullopt;
+    auto text = shrn::read_file(base + ".pid");
+    if (!text || text->empty()) return std::nullopt;
+    return static_cast<pid_t>(std::strtol(text->c_str(), nullptr, 10));
+}
+
+static bool pid_gone(pid_t pid) { return ::kill(pid, 0) == -1 && errno == ESRCH; }
+
+// No zombie left behind: the implementation must have reaped the child itself.
+static bool reaped(pid_t pid) {
+    int status = 0;
+    return ::waitpid(pid, &status, WNOHANG) == -1 && errno == ECHILD;
+}
+
+// Clean up only a child we still own; never signal an already-reaped pid.
+static void force_kill(pid_t pid) {
+    if (pid <= 0) return;
+    int status = 0;
+    pid_t state;
+    do {
+        state = ::waitpid(pid, &status, WNOHANG);
+    } while (state == -1 && errno == EINTR);
+    if (state == 0) {
+        ::kill(pid, SIGKILL);
+        while (::waitpid(pid, &status, 0) == -1 && errno == EINTR) {}
+    }
+}
+
+// Constructors throw once when armed; assignment does not throw.
+// Used to check that failed construction preserves the previous expected state.
+struct Throwy {
+    static bool armed;
+    int code = 0;
+
+    Throwy() = default;
+    explicit Throwy(int c) : code(c) {}
+    Throwy(const Throwy& o) : code(o.code) { boom(); }
+    Throwy(Throwy&& o) : code(o.code) { boom(); }
+    Throwy& operator=(const Throwy& o) {
+        code = o.code;
+        return *this;
+    }
+    Throwy& operator=(Throwy&& o) {
+        code = o.code;
+        return *this;
+    }
+
+    static void boom() {
+        if (armed) {
+            armed = false;
+            throw std::runtime_error("Throwy");
+        }
+    }
+};
+bool Throwy::armed = false;
+
 // expected
-// ---------------------------------------------------------------------------
 static void test_expected() {
-    std::fprintf(stderr, "expected (%s)\n", SHRN_HAS_STD_EXPECTED ? "std" : "polyfill");
+    std::fprintf(stderr, "expected (%s)\n", SHRN_HAS_STD_EXPECTED ? "std" : "fallback");
 
     shrn::result<int> ok = 3;
     shrn::result<int> bad = shrn::unexpected(std::make_error_code(std::errc::io_error));
@@ -92,11 +294,143 @@ static void test_expected() {
     shrn::result<std::string> s = std::string("abc");
     std::string moved = std::move(s).value();
     CHECK(moved == "abc", "rvalue value()");
+
+    // Failed construction must preserve the previous value or error.
+    auto two = shrn::unexpected(Throwy(2));
+
+    shrn::expected<int, Throwy> same(shrn::unexpect, 1);
+    Throwy::armed = true;
+    bool same_state_ok = false;
+    try {
+        same = two;  // error -> error must assign, not destroy + reconstruct
+        same_state_ok = true;
+    } catch (const std::runtime_error&) {
+    }
+    Throwy::armed = false;
+    CHECK(same_state_ok && !same.has_value() && same.error().code == 2, "same-state assignment assigns in place");
+
+    shrn::expected<int, Throwy> keep_value(5);
+    Throwy::armed = true;
+    bool threw_to_error = false;
+    try {
+        keep_value = two;
+    } catch (const std::runtime_error&) {
+        threw_to_error = true;
+    }
+    Throwy::armed = false;
+    CHECK(threw_to_error && keep_value.has_value() && *keep_value == 5,
+          "failed value -> error assignment keeps the old value");
+
+    shrn::expected<Throwy, int> keep_error(shrn::unexpect, 7);
+    Throwy three(3);
+    Throwy::armed = true;
+    bool threw_to_value = false;
+    try {
+        keep_error = three;
+    } catch (const std::runtime_error&) {
+        threw_to_value = true;
+    }
+    Throwy::armed = false;
+    CHECK(threw_to_value && !keep_error.has_value() && keep_error.error() == 7,
+          "failed error -> value assignment keeps the old error");
+
+    shrn::expected<void, Throwy> keep_void;
+    Throwy::armed = true;
+    bool threw_void = false;
+    try {
+        keep_void = two;
+    } catch (const std::runtime_error&) {
+        threw_void = true;
+    }
+    Throwy::armed = false;
+    CHECK(threw_void && keep_void.has_value(), "failed void assignment stays in the value state");
+
+    shrn::expected<void, Throwy> void_error(shrn::unexpect, 1);
+    Throwy::armed = true;
+    try {
+        void_error = two;
+    } catch (const std::runtime_error&) {
+    }
+    Throwy::armed = false;
+    CHECK(!void_error && void_error.error().code == 2,
+          "void error assignment does not discard the error through reconstruction");
+
+    shrn::expected<int, Throwy> copy_source(shrn::unexpect, 9);
+    Throwy::armed = true;
+    bool copy_threw = false;
+    try {
+        keep_value = copy_source;
+    } catch (const std::runtime_error&) {
+        copy_threw = true;
+    }
+    Throwy::armed = false;
+    CHECK(copy_threw && keep_value && *keep_value == 5,
+          "failed expected copy assignment preserves the old value");
+
+    shrn::expected<int, Throwy> sa(5);
+    shrn::expected<int, Throwy> sb(shrn::unexpect, 2);
+    Throwy::armed = true;
+    bool threw_swap = false;
+    try {
+        sa.swap(sb);
+    } catch (const std::runtime_error&) {
+        threw_swap = true;
+    }
+    Throwy::armed = false;
+    CHECK(threw_swap && sa.has_value() && *sa == 5 && !sb.has_value() && sb.error().code == 2,
+          "failed cross-state swap leaves both sides unchanged");
+    sa.swap(sb);
+    CHECK(!sa.has_value() && sa.error().code == 2 && sb.has_value() && *sb == 5, "cross-state swap exchanges states");
+
+    shrn::expected<int, int> nothrow_value(3), nothrow_error(shrn::unexpect, 4);
+    nothrow_value.swap(nothrow_error);
+    CHECK(!nothrow_value && nothrow_value.error() == 4 && nothrow_error && *nothrow_error == 3,
+          "nothrow swap exchanges value and error states");
+
+    // Check mutable lvalue and const rvalue overloads.
+    shrn::result<int> lv = 4;
+    auto lv_t = lv.transform([](int& v) { v += 1; return v; });
+    CHECK(lv_t && *lv_t == 5 && *lv == 5, "transform on a mutable lvalue passes T&");
+    auto lv_a = lv.and_then([](int& v) -> shrn::result<int> {
+        v *= 2;
+        return v;
+    });
+    CHECK(lv_a && *lv_a == 10 && *lv == 10, "and_then on a mutable lvalue passes T&");
+
+    shrn::result<int> lv_bad = shrn::unexpected(std::make_error_code(std::errc::io_error));
+    auto lv_te = lv_bad.transform_error([](std::error_code& e) {
+        e.clear();
+        return 5;
+    });
+    CHECK(!lv_te && lv_te.error() == 5 && !lv_bad.error(), "transform_error on a mutable lvalue passes E&");
+    auto lv_oe = lv_bad.or_else([](std::error_code& e) -> shrn::result<int> {
+        e = std::make_error_code(std::errc::invalid_argument);
+        return 1;
+    });
+    CHECK(lv_oe && *lv_oe == 1 && lv_bad.error() == std::errc::invalid_argument,
+          "or_else on a mutable lvalue passes E&");
+
+    const shrn::result<std::string> cs = std::string("xy");
+    auto cs_t = std::move(cs).transform([](const std::string&& v) { return v.size(); });
+    CHECK(cs_t && *cs_t == 2, "const rvalue transform passes const T&&");
+    CHECK(std::move(cs).value() == "xy", "const rvalue value()");
+    const shrn::result<int> cs_bad = shrn::unexpected(std::make_error_code(std::errc::io_error));
+    auto cs_oe = std::move(cs_bad).or_else(
+        [](const std::error_code&& e) -> shrn::result<int> { return e == std::errc::io_error ? 1 : 0; });
+    CHECK(cs_oe && *cs_oe == 1, "const rvalue or_else passes const E&&");
+
+    const shrn::result<void> cv{};
+    auto cv_t = std::move(cv).transform([] { return 8; });
+    CHECK(cv_t && *cv_t == 8, "const rvalue void transform");
+    shrn::result<void> mv = shrn::unexpected(std::make_error_code(std::errc::io_error));
+    auto mv_oe = mv.or_else([](std::error_code& e) -> shrn::result<void> {
+        e = std::make_error_code(std::errc::invalid_argument);
+        return {};
+    });
+    CHECK(mv_oe.has_value() && mv.error() == std::errc::invalid_argument, "void or_else on a mutable lvalue passes E&");
 }
 
-// ---------------------------------------------------------------------------
 // files
-// ---------------------------------------------------------------------------
 static void test_files(const fs::path& dir) {
     std::fprintf(stderr, "files\n");
 
@@ -113,6 +447,14 @@ static void test_files(const fs::path& dir) {
     CHECK(shrn::file_first_byte(text).value() == 'a', "first_byte plain");
     CHECK(!shrn::file_is_gzipped(text), "text not gzipped");
 
+#if defined(__linux__)
+    if (fs::exists("/proc/self/status")) {
+        auto status = shrn::read_file("/proc/self/status");
+        CHECK(status && status->find("Pid:\t" + std::to_string(::getpid()) + "\n") != std::string::npos,
+              "read_file reads virtual files whose reported size is zero");
+    }
+#endif
+
     auto empty = dir / "empty.txt";
     write_file(empty, "");
     CHECK(shrn::file_readable(empty) && !shrn::file_non_empty(empty), "empty readable but not non-empty");
@@ -127,6 +469,8 @@ static void test_files(const fs::path& dir) {
     auto longline = dir / "long.txt";
     write_file(longline, std::string(70000, 'x') + "\n" + std::string(70000, 'y') + "\n");
     CHECK(shrn::line_count(longline).value() == 2, "line_count with lines longer than any buffer");
+    CHECK(shrn::read_file(longline).value() == std::string(70000, 'x') + "\n" + std::string(70000, 'y') + "\n",
+          "read_file preserves contents across buffer boundaries");
 
     CHECK(shrn::line_count(missing).has_value() == false, "line_count missing is an error");
 
@@ -149,6 +493,10 @@ static void test_files(const fs::path& dir) {
     CHECK(shrn::read_file(cat).value() == "a\nb\nc" + shrn::read_file(longline).value(), "concat raw bytes");
     auto cat_bad = shrn::concat_files({text, missing}, cat);
     CHECK(!cat_bad && cat_bad.error() == std::errc::no_such_file_or_directory, "concat missing input fails");
+
+    auto plain_cat = shrn::concat_files({text, empty, text}, cat, shrn::concat_mode::decompress);
+    CHECK(plain_cat && shrn::read_file(cat).value() == "a\nb\nca\nb\nc",
+          "decompress mode passes plain and empty inputs through with or without zlib");
 
 #if SHRN_HAS_ZLIB
     auto gz = dir / "data.gz";
@@ -179,12 +527,13 @@ static void test_files(const fs::path& dir) {
     write_file(gz, "\x1f\x8b\x08rest");
     auto lc = shrn::line_count(gz);
     CHECK(!lc && lc.error() == shrn::errc::zlib_unavailable, "gzip without zlib -> zlib_unavailable");
+    auto cat_gz = shrn::concat_files({gz}, cat, shrn::concat_mode::decompress);
+    CHECK(!cat_gz && cat_gz.error() == shrn::errc::zlib_unavailable,
+          "decompress mode rejects gzip input without zlib");
 #endif
 }
 
-// ---------------------------------------------------------------------------
 // temp
-// ---------------------------------------------------------------------------
 static void test_temp(const fs::path& dir) {
     std::fprintf(stderr, "temp\n");
 
@@ -220,9 +569,42 @@ static void test_temp(const fs::path& dir) {
     CHECK(!fs::exists(tree), "TempDir removed recursively");
 }
 
-// ---------------------------------------------------------------------------
 // process
-// ---------------------------------------------------------------------------
+static void test_which(const fs::path& dir) {
+    auto previous_dir = fs::current_path();
+    const char* path_env = std::getenv("PATH");
+    std::optional<std::string> previous_path;
+    if (path_env) previous_path = path_env;
+    auto tool = dir / "which-tool";
+    write_file(tool, "#!/bin/sh\nexit 0\n");
+    CHECK(::chmod(tool.c_str(), 0700) == 0, "make PATH fixture executable");
+    fs::current_path(dir);
+    for (const char* path : {"", "/shrn-nonexistent:", ":/shrn-nonexistent"}) {
+        ::setenv("PATH", path, 1);
+        auto found = shrn::which("which-tool");
+        auto ran = shrn::run({"which-tool"});
+        CHECK(found && fs::equivalent(*found, tool) && ran && ran->success(),
+              "empty PATH components resolve the current directory like execvp");
+    }
+    CHECK(!shrn::which(dir.string()), "which rejects explicit directory paths");
+    auto first = dir / "which-first";
+    auto second = dir / "which-second";
+    fs::create_directories(first / "which-tool");
+    fs::create_directory(second);
+    fs::copy_file(tool, second / "which-tool");
+    ::setenv("PATH", (first.string() + ":" + second.string()).c_str(), 1);
+    auto found = shrn::which("which-tool");
+    CHECK(found && fs::equivalent(*found, second / "which-tool"),
+          "PATH lookup skips a directory with the command name");
+    ::unsetenv("PATH");
+    auto shell = shrn::which("sh");
+    auto ran = shrn::run({"sh", "-c", "exit 0"});
+    CHECK(shell && ran && ran->success(), "unset PATH uses the system executable search path");
+    if (previous_path) ::setenv("PATH", previous_path->c_str(), 1);
+    else ::unsetenv("PATH");
+    fs::current_path(previous_dir);
+}
+
 static void test_process(const fs::path& dir) {
     std::fprintf(stderr, "process\n");
 
@@ -243,7 +625,6 @@ static void test_process(const fs::path& dir) {
     auto code = shrn::run({"sh", "-c", "echo oops >&2; exit 3"});
     CHECK(code && !code->success() && code->exit_code == 3, "exit code propagated");
     CHECK(code->stderr_output == "oops\n", "stderr captured");
-    CHECK(code->summary() == "exited with code 3", "summary exit");
 
     shrn::RunOptions no_capture;
     no_capture.capture_stderr = false;
@@ -253,24 +634,6 @@ static void test_process(const fs::path& dir) {
 
     auto sig = shrn::run({"sh", "-c", "kill -9 $$"});
     CHECK(sig && sig->signal == 9 && sig->exit_code == -1 && !sig->success(), "signal death reported");
-    CHECK(sig->summary().rfind("killed by signal 9", 0) == 0, "summary signal");
-
-    shrn::RunOptions to;
-    to.timeout = 200ms;
-    auto t0 = std::chrono::steady_clock::now();
-    auto slow = shrn::run({"sleep", "5"}, to);
-    auto elapsed = std::chrono::steady_clock::now() - t0;
-    CHECK(slow && slow->timed_out && slow->signal == SIGKILL && !slow->success(), "timeout kills child (capturing)");
-    CHECK(elapsed < 3s, "timeout enforced promptly (capturing)");
-
-    to.capture_stderr = false;
-    t0 = std::chrono::steady_clock::now();
-    auto slow2 = shrn::run({"sleep", "5"}, to);
-    elapsed = std::chrono::steady_clock::now() - t0;
-    CHECK(slow2 && slow2->timed_out && !slow2->success(), "timeout kills child (non-capturing)");
-    CHECK(elapsed < 3s, "timeout enforced promptly (non-capturing)");
-    auto fast = shrn::run({"true"}, to);
-    CHECK(fast && fast->success() && !fast->timed_out, "fast child under timeout is not flagged");
 
     shrn::RunOptions redirect;
     redirect.stdout_file = dir / "out.txt";
@@ -288,9 +651,260 @@ static void test_process(const fs::path& dir) {
     CHECK(!wd && wd.error() == std::errc::no_such_file_or_directory, "bad workdir -> launch error");
 }
 
-// ---------------------------------------------------------------------------
+// process: stderr capture and file descriptors
+static void test_process_edges(const fs::path& dir) {
+    std::fprintf(stderr, "process stderr and descriptors\n");
+    const std::string self = g_self_exe.string();
+
+    // Capture all stderr, both when it fits in the pipe and when it exceeds capacity.
+    auto buffered = shrn::run({self, "--helper=emit-bytes", "60000"});
+    CHECK(buffered && buffered->success() && buffered->stderr_output == std::string(60000, 'x'),
+          "stderr buffered by an exited child is drained completely");
+    auto streamed = shrn::run({self, "--helper=emit-bytes", "1048576"});
+    CHECK(streamed && streamed->success() && streamed->stderr_output == std::string(1048576, 'x'),
+          "stderr larger than the pipe is captured completely");
+
+    // Closing stderr early is not an exit: a timed wait must still expire.
+    auto closed = shrn::spawn({self, "--helper=close-stderr-sleep", "600"});
+    CHECK(closed.has_value(), "spawn child that closes stderr");
+    if (closed) {
+        auto expired = closed->wait_for(100ms);
+        CHECK(expired && *expired == shrn::wait_status::timeout,
+              "early stderr EOF is not mistaken for child exit");
+        auto& r = closed->wait();
+        CHECK(r && r->success(), "child that closed stderr reports its real exit status");
+    }
+
+    // Descendants holding stderr must not delay the direct child's result.
+    auto t0 = std::chrono::steady_clock::now();
+    auto orphan = shrn::run({self, "--helper=orphan-stderr", "3000"});
+    auto elapsed = std::chrono::steady_clock::now() - t0;
+    CHECK(orphan && orphan->success() && orphan->stderr_output == "direct\n",
+          "stderr written before exit survives a descendant holding the pipe");
+    CHECK(elapsed < 1500ms, "run returns when the direct child exits, not when descendants do");
+
+    auto held = shrn::spawn({self, "--helper=orphan-stderr", "3000"});
+    CHECK(held.has_value(), "spawn child with a descendant on stderr");
+    if (held) {
+        t0 = std::chrono::steady_clock::now();
+        auto ready = held->wait_for(2s);
+        auto& r = held->wait();
+        elapsed = std::chrono::steady_clock::now() - t0;
+        CHECK(ready && *ready == shrn::wait_status::ready,
+              "a timed wait returns when the direct child exits");
+        CHECK(r && r->success() && r->stderr_output == "direct\n",
+              "buffered stderr survives a descendant keeping the pipe open");
+        CHECK(elapsed < 1500ms, "waiting ends with the direct child, not the descendant");
+    }
+
+    // Internal pipe and redirection descriptors must be closed by exec.
+    std::vector<int> baseline;
+    for (int fd = 3; fd < 256; ++fd)
+        if (::fcntl(fd, F_GETFD) != -1) baseline.push_back(fd);
+    shrn::RunOptions redirect;
+    redirect.stdout_file = dir / "fdprobe.out";
+    auto probe = shrn::run({self, "--helper=open-fds"}, redirect);
+    bool leaked = false;
+    if (probe) {
+        for (std::size_t i = 0; i + 3 < probe->stderr_output.size();) {
+            std::size_t eol = probe->stderr_output.find('\n', i);
+            if (eol == std::string::npos) break;
+            int fd = std::atoi(probe->stderr_output.c_str() + i + 3);  // skip "fd="
+            bool inherited = false;
+            for (int b : baseline) inherited = inherited || b == fd;
+            if (!inherited) leaked = true;
+            i = eol + 1;
+        }
+    }
+    CHECK(probe && probe->success() && !leaked, "run() leaks no pipe or redirection descriptor into the child");
+
+    // Redirection must work even when the parent has closed descriptors 0/1/2.
+    auto closed_stdio = shrn::run({self, "--helper=closed-stdio", dir.string()});
+    CHECK(closed_stdio && closed_stdio->success(),
+          "run() works with stdin/stdout/stderr closed (see helper exit code for the failing check)");
+}
+
+// process: spawn, wait, terminate
+static void test_process_spawn(const fs::path& dir) {
+    std::fprintf(stderr, "process spawn\n");
+    const std::string self = g_self_exe.string();
+
+    CHECK(std::is_default_constructible_v<shrn::Process>, "Process is default-constructible");
+    CHECK(!std::is_copy_constructible_v<shrn::Process> && !std::is_copy_assignable_v<shrn::Process>,
+          "Process is not copyable");
+    CHECK(std::is_move_constructible_v<shrn::Process> && std::is_move_assignable_v<shrn::Process>,
+          "Process is movable");
+    {
+        shrn::Process unstarted;  // destroying an unstarted Process must be harmless
+        auto state = unstarted.running();
+        auto timed = unstarted.wait_for(0ms);
+        CHECK(!state, "running() on a Process without a child reports an error");
+        CHECK(!timed, "wait_for() on a Process without a child reports an error");
+        CHECK(!unstarted.wait(), "wait() on a Process without a child reports an error");
+    }
+
+    // Launch errors surface at spawn time, before any wait.
+    auto empty = shrn::spawn({});
+    CHECK(!empty && empty.error() == shrn::errc::empty_command, "spawn: empty argv -> errc::empty_command");
+    auto enoent = shrn::spawn({"shrn-definitely-not-a-command"});
+    CHECK(!enoent && enoent.error() == std::errc::no_such_file_or_directory,
+          "spawn reports the exec failure, not a started process");
+    shrn::RunOptions badwd;
+    badwd.workdir = dir / "nowhere";
+    auto wd = shrn::spawn({"true"}, badwd);
+    CHECK(!wd && wd.error() == std::errc::no_such_file_or_directory, "spawn reports a bad workdir");
+
+    // Both children must be alive at the same time: each waits for the other's marker.
+    auto ma = (dir / "spawn_a.mark").string();
+    auto mb = (dir / "spawn_b.mark").string();
+    auto pa = shrn::spawn({self, "--helper=rendezvous", ma, mb});
+    auto pb = shrn::spawn({self, "--helper=rendezvous", mb, ma});
+    CHECK(pa && pb, "two children spawn without waiting");
+    if (pa && pb) {
+        auto& ra = pa->wait();
+        auto& rb = pb->wait();
+        CHECK(ra && ra->success() && rb && rb->success(),
+              "spawn returns before completion, so both children run concurrently");
+    }
+
+    // A spawn while another child is live must not leak that child's capture pipe.
+    std::vector<int> baseline;  // taken before any capture pipe exists
+    for (int fd = 3; fd < 256; ++fd)
+        if (::fcntl(fd, F_GETFD) != -1) baseline.push_back(fd);
+    auto pbase = (dir / "proc_fds").string();
+    auto holder = shrn::spawn({self, "--helper=pid-sleep-touch", pbase, "700"});
+    auto probe = shrn::spawn({self, "--helper=open-fds"});
+    CHECK(holder && probe, "spawn a descriptor probe while another child is live");
+    if (holder && probe) {
+        auto& pr = probe->wait();
+        bool leaked = false;
+        if (pr) {
+            for (std::size_t i = 0; i + 3 < pr->stderr_output.size();) {
+                std::size_t eol = pr->stderr_output.find('\n', i);
+                if (eol == std::string::npos) break;
+                int fd = std::atoi(pr->stderr_output.c_str() + i + 3);  // skip "fd="
+                bool inherited = false;
+                for (int b : baseline) inherited = inherited || b == fd;
+                if (!inherited) leaked = true;
+                i = eol + 1;
+            }
+        }
+        CHECK(pr && pr->success() && !leaked, "a concurrent spawn inherits no descriptor of the live child");
+        auto& hr = holder->wait();
+        CHECK(hr && hr->success(), "the live child is unaffected by the concurrent spawn");
+    }
+
+    // running() / wait_for() observe a live child without killing it.
+    auto lbase = (dir / "proc_live").string();
+    auto live = shrn::spawn({self, "--helper=pid-sleep-touch", lbase, "700"});
+    CHECK(live.has_value(), "spawn a child that outlives the first check");
+    if (live) {
+        auto pid = child_pid(lbase);
+        CHECK(pid.has_value(), "spawned child published its pid");
+        auto expired = live->wait_for(50ms);
+        CHECK(expired && *expired == shrn::wait_status::timeout, "wait_for expires while the child runs");
+        auto alive = live->running();
+        CHECK(alive && *alive, "running() is true before exit and wait_for did not kill");
+        auto ready = live->wait_for(5s);
+        CHECK(ready && *ready == shrn::wait_status::ready, "wait_for observes the exit");
+        auto done = live->running();
+        CHECK(done && !*done, "running() is false after the child exits");
+        auto& r = live->wait();
+        CHECK(r && r->success(), "wait after wait_for reports the exit status");
+        auto& again = live->wait();
+        CHECK(again && again->exit_code == 0, "repeated wait returns the completed result");
+        CHECK(fs::exists(lbase + ".late"), "an unterminated child runs to completion");
+        CHECK(live->terminate().has_value(), "terminate on a finished process succeeds");
+        if (pid) {
+            CHECK(reaped(*pid), "a waited child leaves no zombie");
+            force_kill(*pid);
+        }
+    }
+
+    // terminate() kills the direct child and finalizes its status.
+    auto kbase = (dir / "proc_kill").string();
+    auto doomed = shrn::spawn({self, "--helper=pid-sleep-touch", kbase, "4000"});
+    CHECK(doomed.has_value(), "spawn a child to terminate");
+    if (doomed) {
+        auto pid = child_pid(kbase);
+        auto t0 = std::chrono::steady_clock::now();
+        CHECK(doomed->terminate().has_value(), "terminate succeeds on a live child");
+        auto& r = doomed->wait();
+        auto elapsed = std::chrono::steady_clock::now() - t0;
+        CHECK(r && r->signal == SIGKILL && !r->success(), "terminated child reports SIGKILL");
+        CHECK(elapsed < 2s, "terminate does not wait out the child's sleep");
+        CHECK(!fs::exists(kbase + ".late"), "terminated child never finished its work");
+        if (pid) {
+            CHECK(pid_gone(*pid) && reaped(*pid), "terminate reaps the child");
+            force_kill(*pid);
+        }
+    }
+
+    // Ownership and captured output survive moves; moved-from objects reap nothing.
+    shrn::RunOptions to_file;
+    to_file.stdout_file = dir / "moved.out";
+    auto src = shrn::spawn({self, "--helper=emit"}, to_file);
+    CHECK(src.has_value(), "spawn a child for the move test");
+    if (src) {
+        shrn::Process slot;
+        {
+            shrn::Process moved(std::move(*src));
+            slot = std::move(moved);
+        }  // both moved-from objects are destroyed while the child is still unwaited
+        auto& r = slot.wait();
+        CHECK(r && r->exit_code == 7 && r->stderr_output == "ERR\n",
+              "a moved Process keeps its child and captured stderr");
+        CHECK(shrn::read_file(dir / "moved.out").value_or(std::string()) == "OUT\n",
+              "stdout_file redirection survives the move");
+    }
+
+    // The destructor waits for the child and reaps it.
+    auto dbase = (dir / "proc_dtor").string();
+    std::optional<pid_t> dpid;
+    {
+        auto owned = shrn::spawn({self, "--helper=pid-sleep-touch", dbase, "300"});
+        CHECK(owned.has_value(), "spawn a child for the destructor test");
+        dpid = child_pid(dbase);
+    }
+    CHECK(fs::exists(dbase + ".late"), "the destructor waits for the pending child");
+    if (dpid) {
+        CHECK(reaped(*dpid), "the destructor leaves no zombie behind");
+        force_kill(*dpid);
+    }
+
+    // A capturing reader drains a full pipe while the caller does unrelated work.
+    auto flood_base = (dir / "proc_flood").string();
+    auto flood = shrn::spawn({self, "--helper=emit-bytes", "1048576", flood_base});
+    CHECK(flood.has_value(), "spawn a stderr flood");
+    if (flood) {
+        auto pid = child_pid(flood_base);
+        bool finished_before_wait = wait_until([&] {
+            auto active = flood->running();
+            return active && !*active;
+        }, 2s);
+        CHECK(finished_before_wait, "capture reader lets the child finish before wait()");
+        if (!finished_before_wait && pid) force_kill(*pid);
+        auto& r = flood->wait();
+        CHECK(r && r->success() && r->stderr_output == std::string(1048576, 'x'),
+              "captured stderr past the pipe capacity is drained by the reader");
+    }
+
+    // stdout_file is plain redirection: no reader is needed to keep the child moving.
+    shrn::RunOptions big_out;
+    big_out.stdout_file = dir / "spawn_big.out";
+    big_out.capture_stderr = false;
+    auto redirected = shrn::spawn({self, "--helper=emit-out-bytes", "1048576"}, big_out);
+    CHECK(redirected.has_value(), "spawn a stdout flood without capture");
+    if (redirected) {
+        auto& r = redirected->wait();
+        CHECK(r && r->success() && r->stderr_output.empty(),
+              "capture_stderr=false leaves stderr_output empty");
+        CHECK(shrn::read_file(dir / "spawn_big.out").value_or(std::string()) == std::string(1048576, 'o'),
+              "stdout_file receives the whole stream without a reader");
+    }
+}
+
 // Outcome
-// ---------------------------------------------------------------------------
 static void test_outcome(const fs::path& dir) {
     std::fprintf(stderr, "outcome\n");
 
@@ -346,7 +960,7 @@ static void test_outcome(const fs::path& dir) {
     CHECK(!rl.ok() && rl.detail().rfind("shrn-definitely-not-a-command: cannot execute: ", 0) == 0,
           "proc maps launch error");
 
-    // Pre-run checks gate the spawn; post-run checks carry the command prefix.
+    // Failed preconditions prevent execution; output errors include the command name.
     auto marker = dir / "marker.txt";
     auto gated = shrn::stage("gated")
                      .expect_file(absent)
@@ -394,7 +1008,254 @@ static void test_outcome(const fs::path& dir) {
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == EXIT_FAILURE, "or_die_if(true) exits with EXIT_FAILURE");
 }
 
-int main() {
+// Outcome: asynchronous commands
+static void test_outcome_async(const fs::path& dir) {
+    std::fprintf(stderr, "outcome async\n");
+    const std::string self = g_self_exe.string();
+
+    // Two stages start their commands before either result is awaited.
+    auto ma = (dir / "out_a.mark").string();
+    auto mb = (dir / "out_b.mark").string();
+    auto first = shrn::stage("first").proc({self, "--helper=rendezvous", ma, mb});
+    auto second = shrn::stage("second").proc({self, "--helper=rendezvous", mb, ma});
+    first.wait();
+    second.wait();
+    CHECK(first.ok() && second.ok(), "proc() returns before the child exits");
+
+    // The next proc waits for the previous command; expectations wait too.
+    auto seq = dir / "seq.txt";
+    auto ordered = shrn::stage("ordered")
+                       .proc({self, "--helper=sleep-then-write", seq.string(), "250"})
+                       .proc({"sh", "-c", "printf second >> " + seq.string()})
+                       .expect_file(seq, shrn::Expect::NON_EMPTY);
+    CHECK(ordered.ok(), "sequenced commands both succeed");
+    CHECK(shrn::read_file(seq).value_or(std::string()) == "firstsecond",
+          "a following command starts only after the previous one finished");
+
+    // A deferred predicate is evaluated once, after the command exits.
+    auto late = dir / "deferred.txt";
+    int evaluations = 0;
+    auto deferred = shrn::stage("deferred")
+                        .proc({self, "--helper=sleep-then-write", late.string(), "250"})
+                        .expect([&] { ++evaluations; return fs::exists(late); }, "output written");
+    CHECK(deferred.ok() && evaluations == 1, "deferred predicate runs once after the command exits");
+
+    int skipped = 0;
+    auto gated = shrn::stage("gated").expect(false, "pre").expect([&] { ++skipped; return true; }, "never");
+    CHECK(!gated.ok() && skipped == 0, "deferred predicate is skipped after a recorded failure");
+
+    // A failed command prevents the next one from starting.
+    auto blocked = dir / "blocked.mark";
+    auto failing = shrn::stage("failing")
+                       .proc({"sh", "-c", "echo boom >&2; exit 4"})
+                       .proc({"sh", "-c", "touch " + blocked.string()});
+    CHECK(!failing.ok() && failing.detail() == "sh: exited with code 4", "failed command is reported");
+    CHECK(failing.stderr_output() == "boom\n", "stderr of the failed command is kept");
+    CHECK(!fs::exists(blocked), "no command starts after a failure");
+
+    // running() and wait_for() observe a live child; expiry is not a failure and kills nothing.
+    auto lbase = (dir / "out_live").string();
+    auto live = shrn::stage("live").proc({self, "--helper=pid-sleep-touch", lbase, "700"});
+    auto lpid = child_pid(lbase);
+    CHECK(lpid.has_value(), "stage child published its pid");
+    CHECK(live.wait_for(50ms) == shrn::wait_status::timeout, "wait_for expires while the child runs");
+    CHECK(live.running(), "running() reports the live child");
+    CHECK(live.wait_for(5s) == shrn::wait_status::ready, "wait_for observes the exit");
+    CHECK(!live.running(), "running() is false after the child exits");
+    live.wait();
+    CHECK(live.ok(), "an expired wait_for is not a stage failure");
+    CHECK(fs::exists(lbase + ".late"), "wait_for does not kill the child");
+    if (lpid) {
+        CHECK(reaped(*lpid), "the stage reaps its child");
+        force_kill(*lpid);
+    }
+
+    // expect_done_within() records a failure on expiry without terminating anything.
+    auto sbase = (dir / "out_slow").string();
+    auto slow = shrn::stage("slow").proc({self, "--helper=pid-sleep-touch", sbase, "700"});
+    auto spid = child_pid(sbase);
+    auto t0 = std::chrono::steady_clock::now();
+    slow.expect_done_within(50ms);
+    int notified = 0;
+    slow.or_execute([&] { ++notified; });
+    auto elapsed = std::chrono::steady_clock::now() - t0;
+    std::string timed_detail = slow.detail();
+    CHECK(!slow.ok() && !timed_detail.empty(), "expect_done_within records a failure on expiry");
+    CHECK(notified == 1 && elapsed < 500ms, "a timed failure is actionable without waiting for the child");
+    CHECK(slow.running(), "expect_done_within does not terminate the child");
+    slow.wait();
+    CHECK(!slow.ok() && slow.detail() == timed_detail, "wait() keeps the recorded failure");
+    CHECK(fs::exists(sbase + ".late"), "wait() after a failure still finishes the child");
+    if (spid) {
+        CHECK(reaped(*spid), "the child finished by wait() is reaped");
+        force_kill(*spid);
+    }
+
+    // or_terminate() kills the active child and keeps the original failure.
+    auto tbase = (dir / "out_term").string();
+    auto doomed = shrn::stage("doomed").proc({self, "--helper=pid-sleep-touch", tbase, "4000"});
+    auto tpid = child_pid(tbase);
+    t0 = std::chrono::steady_clock::now();
+    doomed.expect_done_within(100ms);
+    std::string doomed_detail = doomed.detail();
+    doomed.or_terminate();
+    elapsed = std::chrono::steady_clock::now() - t0;
+    CHECK(!doomed.ok() && doomed.detail() == doomed_detail, "or_terminate preserves the original failure");
+    CHECK(elapsed < 2s, "or_terminate does not wait the child out");
+    CHECK(!fs::exists(tbase + ".late"), "or_terminate kills the child before it finishes");
+    if (tpid) {
+        CHECK(pid_gone(*tpid) && reaped(*tpid), "or_terminate reaps the child");
+        force_kill(*tpid);
+    }
+
+    // With no recorded failure there is nothing to terminate.
+    auto kbase = (dir / "out_keep").string();
+    auto healthy = shrn::stage("healthy").proc({self, "--helper=pid-sleep-touch", kbase, "200"});
+    healthy.or_terminate();
+    healthy.wait();
+    CHECK(healthy.ok() && fs::exists(kbase + ".late"), "or_terminate leaves a passing stage's child alone");
+
+    // The destructor waits for the pending command; the moved-from temporary must not.
+    auto obase = (dir / "out_dtor").string();
+    std::optional<pid_t> opid;
+    {
+        auto job = shrn::stage("dtor").proc({self, "--helper=pid-sleep-touch", obase, "300"});
+        opid = child_pid(obase);
+        CHECK(job.running() && !fs::exists(obase + ".late"),
+              "the moved stage owns a still-running command");
+    }
+    CHECK(fs::exists(obase + ".late"), "the Outcome destructor waits for the pending command");
+    if (opid) {
+        CHECK(reaped(*opid), "the Outcome destructor reaps the child");
+        force_kill(*opid);
+    }
+
+    // Move assignment transfers the pending command without a second reap.
+    auto mbase = (dir / "out_move").string();
+    shrn::Outcome slot;
+    slot = shrn::stage("moved").proc({self, "--helper=pid-sleep-touch", mbase, "200"});
+    auto mpid = child_pid(mbase);
+    slot.wait();
+    CHECK(slot.ok() && slot.name() == "moved" && fs::exists(mbase + ".late"),
+          "a move-assigned stage completes its pending command");
+    if (mpid) {
+        CHECK(reaped(*mpid), "a move-assigned stage reaps its child once");
+        force_kill(*mpid);
+    }
+    slot = shrn::stage("reused").proc({"true"});
+    CHECK(slot.ok() && slot.name() == "reused", "a completed stage can be replaced");
+
+    // Calls wait for pending commands and forward callable arguments.
+    auto appended = dir / "call_seq.txt";
+    auto suffix = std::make_unique<std::string>("second");
+    std::string echoed;
+    auto sequenced = shrn::stage("calling")
+                         .proc({self, "--helper=sleep-then-write", appended.string(), "250"})
+                         .call(
+                             [target = std::make_unique<fs::path>(appended)](
+                                 std::unique_ptr<std::string> text, std::string& out) {
+                                 std::ofstream file(*target, std::ios::binary | std::ios::app);
+                                 file << *text;
+                                 out = *text;
+                                 return 0;
+                             },
+                             std::move(suffix), echoed);
+    CHECK(sequenced.ok(), "a stage whose call() returns zero succeeds");
+    CHECK(shrn::read_file(appended).value_or(std::string()) == "firstsecond",
+          "call() runs only after the previous command finished");
+    CHECK(echoed == "second" && !suffix,
+          "call() forwards a move-only callable, a move-only argument and an lvalue output");
+
+    // A nonzero return gates later calls and commands.
+    auto after_call = dir / "call_gate.mark";
+    auto untouched = std::make_unique<std::string>("kept");
+    int invocations = 0;
+    auto call_gate = shrn::stage("call gate")
+                         .proc({"true"})
+                         .call([] { return 3; })
+                         .call([&](std::unique_ptr<std::string>) { ++invocations; return 0; },
+                               std::move(untouched))
+                         .proc({"touch", after_call.string()});
+    CHECK(!call_gate.ok(), "a nonzero function return fails the stage");
+    CHECK(invocations == 0 && untouched && *untouched == "kept",
+          "a skipped call() neither runs nor moves its arguments");
+    CHECK(!fs::exists(after_call), "no command starts after a failed call()");
+
+    // after() joins prerequisites that were started concurrently, with no prior wait.
+    auto ja = (dir / "join_a.mark").string();
+    auto jb = (dir / "join_b.mark").string();
+    auto left = shrn::stage("left").proc({self, "--helper=rendezvous", ja, jb});
+    auto right = shrn::stage("right").proc({self, "--helper=rendezvous", jb, ja});
+    CHECK(shrn::stage("both").after(left, right).ok(),
+          "after() joins prerequisites that were running concurrently");
+
+    // Even a prerequisite already marked failed must be joined.
+    auto jbase = (dir / "join_live").string();
+    auto release = (dir / "join_release").string();
+    auto timed = shrn::stage("timed").proc({self, "--helper=rendezvous", jbase + ".pid", release});
+    auto jpid = child_pid(jbase);
+    CHECK(jpid.has_value(), "the joining prerequisite is ready");
+    timed.expect_done_within(0ms);
+    CHECK(!timed.ok() && timed.running(), "the prerequisite failed its deadline while still running");
+    auto original_failure = timed.detail();
+    auto early = shrn::stage("early").call([] { return 5; });
+    auto releaser = shrn::proc({self, "--helper=sleep-then-write", release, "250"});
+    int dependent_calls = 0;
+    auto merged = shrn::stage("merged").after(early, timed).call([&] { ++dependent_calls; return 0; });
+    CHECK(!merged.ok() && dependent_calls == 0, "a failed prerequisite prevents dependent work");
+    CHECK(!timed.running() && fs::exists(release),
+          "after() waits for a failed-but-running prerequisite");
+    releaser.wait();
+    CHECK(releaser.ok(), "the release helper completed");
+    if (jpid) {
+        CHECK(reaped(*jpid), "after() reaps every joined prerequisite");
+        force_kill(*jpid);
+    }
+
+    // The first failure in argument order wins; joined prerequisites stay usable.
+    auto bad_one = shrn::stage("join-first").proc({"sh", "-c", "exit 2"});
+    auto bad_two = shrn::stage("join-second").proc({"sh", "-c", "exit 3"});
+    auto in_order = shrn::stage("in order").after(bad_one, bad_two);
+    auto reversed = shrn::stage("reversed").after(bad_two, bad_one);
+    CHECK(!in_order.ok() && in_order.detail().find(bad_one.name()) != std::string::npos,
+          "after() keeps the first failure in argument order");
+    CHECK(!reversed.ok() && reversed.detail().find(bad_two.name()) != std::string::npos,
+          "an already joined prerequisite can be reused by another stage");
+
+    // A fatal failure cleans up the stage's active child before exiting.
+    auto fbase = (dir / "out_die").string();
+    pid_t forked = ::fork();
+    if (forked == 0) {
+        auto fatal = shrn::stage("fatal").proc({self, "--helper=pid-sleep-touch", fbase, "4000"});
+        if (!child_pid(fbase)) {
+            fatal.expect_done_within(0ms).or_terminate();
+            _exit(97);
+        }
+        fatal.expect_done_within(100ms).or_die_if(true);
+        _exit(0);  // not reached
+    }
+    int status = 0;
+    waitpid(forked, &status, 0);
+    bool died = WIFEXITED(status) && WEXITSTATUS(status) == EXIT_FAILURE;
+    CHECK(died, "or_die_if(true) exits after a timed failure");
+    auto fpid = died ? child_pid(fbase) : std::optional<pid_t>();
+    CHECK(fpid.has_value(), "the dying stage's child published its pid");
+    if (fpid) {
+        CHECK(pid_gone(*fpid), "or_die_if(true) cleans up the active child before exiting");
+        force_kill(*fpid);
+    }
+    CHECK(!fs::exists(fbase + ".late"), "the cleaned-up child never finished its work");
+}
+
+int main(int argc, char** argv) {
+    init_self_exe(argv[0]);
+    if (argc >= 2) {
+        std::string_view first(argv[1]);
+        constexpr std::string_view prefix = "--helper=";
+        if (first.rfind(prefix, 0) == 0)
+            return helper_main(std::string(first.substr(prefix.size())), argc >= 3 ? argv[2] : "",
+                               argc >= 4 ? argv[3] : "");
+    }
     auto root = shrn::TempDir::create("shrn_test_");
     if (!root) {
         std::fprintf(stderr, "cannot create temp dir: %s\n", root.error().message().c_str());
@@ -404,8 +1265,12 @@ int main() {
     test_expected();
     test_files(root->path());
     test_temp(root->path());
+    test_which(root->path());
     test_process(root->path());
+    test_process_edges(root->path());
+    test_process_spawn(root->path());
     test_outcome(root->path());
+    test_outcome_async(root->path());
 
     std::fprintf(stderr, "%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
