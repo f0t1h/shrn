@@ -204,7 +204,7 @@ CMake, FetchContent:
 include(FetchContent)
 FetchContent_Declare(shrn
     GIT_REPOSITORY https://github.com/f0t1h/shrn.git
-    GIT_TAG        v0.2.0)
+    GIT_TAG        v0.3.0)
 FetchContent_MakeAvailable(shrn)
 target_link_libraries(your_target PRIVATE shrn::shrn)
 ```
