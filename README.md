@@ -42,8 +42,8 @@ reporting; child programs and user callbacks control their own output.
 No shrn function throws. Allocation failure during stderr capture and
 thread-creation failure are reported through the same error strings as every
 other failure. Exceptions from `call()` callbacks propagate to the caller;
-that is the callback throwing, not shrn. Functions returning `std::string`
-still allocate; under OOM the allocation itself is the failure.
+that is the callback throwing, not shrn. The header also builds with
+`-fno-exceptions`; in that mode thread-creation failure terminates the process.
 
 ## Processes
 
@@ -210,8 +210,9 @@ target_link_libraries(your_target PRIVATE shrn::shrn)
 ```
 
 Installed package: `find_package(shrn CONFIG REQUIRED)` then link `shrn::shrn`.
-Or copy `include/shrn.hpp`, enable thread support (`-pthread` with GCC/Clang on
-Linux). The CMake target carries the Threads dependency.
+Or copy `include/shrn.hpp` and enable thread support (`-pthread` with
+GCC/Clang on Linux). The CMake target carries the Threads dependency; shrn
+needs nothing else — no Boost, no zlib.
 
 ## Tests
 
