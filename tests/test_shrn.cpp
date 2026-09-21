@@ -620,14 +620,14 @@ static void test_outcome(const fs::path& dir) {
     auto es = shrn::Outcome().expect_success(2);
     CHECK(!es.ok() && es.detail() == "exited with code 2", "expect_success(nonzero) fails");
 
-    auto o1 = shrn::Outcome().expect_file(present, shrn::Expect::NON_EMPTY);
+    auto o1 = shrn::Outcome().expect_file(present, shrn::file_non_empty, "non-empty");
     CHECK(o1.ok(), "existing non-empty passes");
 
-    auto o2 = shrn::Outcome().expect_file(absent, shrn::Expect::NON_EMPTY);
+    auto o2 = shrn::Outcome().expect_file(absent, shrn::file_non_empty, "non-empty");
     CHECK(!o2.ok() && o2.detail() == "missing: " + absent.string(), "missing reported before emptiness");
 
-    auto o3 = shrn::Outcome().expect_file(blank, shrn::Expect::NON_EMPTY);
-    CHECK(!o3.ok() && o3.detail() == "empty: " + blank.string(), "empty reported");
+    auto o3 = shrn::Outcome().expect_file(blank, shrn::file_non_empty, "non-empty");
+    CHECK(!o3.ok() && o3.detail() == "not non-empty: " + blank.string(), "empty reported");
 
 
     auto is_fastq = [](const fs::path& p) { return std::ifstream(p).get() == '@'; };
@@ -636,7 +636,7 @@ static void test_outcome(const fs::path& dir) {
     auto o6 = shrn::Outcome().expect_file(blank, is_fastq, "FASTQ");
     CHECK(!o6.ok() && o6.detail() == "not FASTQ: " + blank.string(), "predicate failure message");
 
-    auto o7 = shrn::Outcome().expect_file(absent).expect_file(blank, shrn::Expect::NON_EMPTY);
+    auto o7 = shrn::Outcome().expect_file(absent).expect_file(blank, shrn::file_non_empty, "non-empty");
     CHECK(o7.detail() == "missing: " + absent.string(), "first failure wins");
 
     CHECK(shrn::Outcome().expect_which("sh").ok(), "expect_which finds sh");
@@ -673,7 +673,7 @@ static void test_outcome(const fs::path& dir) {
 
     auto chain = shrn::stage("chain")
                      .proc({"sh", "-c", "echo one > " + marker.string()})
-                     .expect_file(marker, shrn::Expect::NON_EMPTY)
+                     .expect_file(marker, shrn::file_non_empty, "non-empty")
                      .proc({"sh", "-c", "exit 4"})
                      .proc({"sh", "-c", "rm " + marker.string()});
     CHECK(!chain.ok() && chain.detail() == "sh: exited with code 4", "second command failure reported");
@@ -726,7 +726,7 @@ static void test_outcome_async(const fs::path& dir) {
     auto ordered = shrn::stage("ordered")
                        .proc({self, "--helper=sleep-then-write", seq.string(), "250"})
                        .proc({"sh", "-c", "printf second >> " + seq.string()})
-                       .expect_file(seq, shrn::Expect::NON_EMPTY);
+                       .expect_file(seq, shrn::file_non_empty, "non-empty");
     CHECK(ordered.ok(), "sequenced commands both succeed");
     CHECK(slurp(seq) == "firstsecond",
           "a following command starts only after the previous one finished");

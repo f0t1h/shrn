@@ -17,9 +17,9 @@ int main() {
 
     shrn::stage("sort input")
         .expect_which("sort")
-        .expect_file("input.txt", shrn::Expect::NON_EMPTY)
+        .expect_file("input.txt", shrn::file_non_empty, "non-empty")
         .proc({"sort", "input.txt"}, options)
-        .expect_file("sorted.txt", shrn::Expect::NON_EMPTY)
+        .expect_file("sorted.txt", shrn::file_non_empty, "non-empty")
         .or_die_if(true);
 }
 ```
@@ -101,10 +101,11 @@ prefixes error details (for example, `"minimap2: missing: out.paf"`).
 name (or the last command when the stage is anonymous); `or_die_if(cond, name)`
 overrides it.
 
-`expect_file(path)` requires a readable regular file. Add `Expect::NON_EMPTY`,
-or pass a predicate and a label:
-`expect_file(path, predicate, "FASTQ")`. The predicate receives `const std::filesystem::path&`
-and returns whether the file is acceptable.
+`expect_file(path)` requires a readable regular file. Add a predicate and a
+label for anything stricter, e.g. `expect_file(path, shrn::file_non_empty,
+"non-empty")` or `expect_file(path, is_fastq, "FASTQ")`. The predicate receives
+`const std::filesystem::path&` and returns whether the file is acceptable; a
+failed check is reported as `not <label>: <path>`.
 
 Use `expect([&] { return check_output(); }, "output check")` to evaluate a check
 after the command finishes. With `expect(bool, label)`, C++ evaluates the boolean

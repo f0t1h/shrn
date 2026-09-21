@@ -34,7 +34,7 @@ int main() {
         return 1;
     }
     return shrn::stage("verify output")
-        .expect_file(output, shrn::Expect::NON_EMPTY)
+        .expect_file(output, shrn::file_non_empty, "non-empty")
         .or_die_if(true)
         .code();
 }

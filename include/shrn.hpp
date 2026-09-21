@@ -826,17 +826,6 @@ inline Process spawn(const std::vector<std::string>& args, const RunOptions& opt
 
 // Outcome: ordered checks and commands
 
-enum class Expect : unsigned {
-    EXISTS    = 0,       ///< readable regular file (always checked)
-    NON_EMPTY = 1u << 0, ///< size > 0
-};
-
-[[nodiscard]] constexpr Expect operator|(Expect a, Expect b) noexcept {
-    return static_cast<Expect>(static_cast<unsigned>(a) | static_cast<unsigned>(b));
-}
-[[nodiscard]] constexpr bool has_flag(Expect flags, Expect flag) noexcept {
-    return (static_cast<unsigned>(flags) & static_cast<unsigned>(flag)) != 0;
-}
 
 /// Ordered asynchronous commands and checks; skip later operations after failure.
 class Outcome {
@@ -983,14 +972,13 @@ public:
         return std::move(expect(std::forward<Pred>(pred), detail));
     }
 
-    Outcome& expect_file(const fs::path& p, Expect flags = Expect::EXISTS) & {
+    Outcome& expect_file(const fs::path& p) & {
         if (!ok()) return *this;
         if (!file_readable(p)) fail("missing: " + p.string());
-        else if (has_flag(flags, Expect::NON_EMPTY) && !file_non_empty(p)) fail("empty: " + p.string());
         return *this;
     }
-    Outcome&& expect_file(const fs::path& p, Expect flags = Expect::EXISTS) && {
-        return std::move(expect_file(p, flags));
+    Outcome&& expect_file(const fs::path& p) && {
+        return std::move(expect_file(p));
     }
 
     template <class Pred>
