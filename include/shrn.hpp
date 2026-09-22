@@ -815,6 +815,7 @@ public:
 
 private:
     friend class Outcome;
+    friend class StageTemplate;
     std::variant<std::string, temp_file> value_;
 };
 
@@ -1203,6 +1204,14 @@ struct slot {
     slot(std::string n, std::string d) : name(std::move(n)), default_value(std::move(d)) {}
 };
 
+/// A list placeholder, bound to a vector of paths at exec. It expands in
+/// place in argv and, in expect_file, checks every element. Required unless
+/// it appears only inside optional groups; a bound empty list is valid.
+struct many {
+    std::string name;
+    explicit many(std::string n) : name(std::move(n)) {}
+};
+
 class TArg;
 
 /// An argv fragment included whole when every slot inside it is bound (or
@@ -1212,7 +1221,7 @@ struct optional {
     optional(std::initializer_list<TArg> a);
 };
 
-/// One template argv element: text, a temp token, a slot, or an optional group.
+/// One template argv element: text, a temp token, a slot, a list, or an optional group.
 class TArg {
 public:
     TArg(const char* text) : value_(std::string(text)) {}
@@ -1220,24 +1229,32 @@ public:
     TArg(const fs::path& path) : value_(path.string()) {}
     TArg(temp_file token) : value_(std::move(token)) {}
     TArg(slot s) : value_(std::move(s)) {}
+    TArg(many m) : value_(std::move(m)) {}
     TArg(optional group) : value_(std::make_shared<optional>(std::move(group))) {}
 
 private:
     friend class StageTemplate;
-    std::variant<std::string, temp_file, slot, std::shared_ptr<optional>> value_;
+    std::variant<std::string, temp_file, slot, many, std::shared_ptr<optional>> value_;
 };
 
 inline optional::optional(std::initializer_list<TArg> a) : args(a) {}
 
-/// A binding target: a concrete path, or a temp token so the caller decides at
-/// exec whether an output is scratch or a deliverable.
+/// A binding target: a concrete path, a temp token so the caller decides at
+/// exec whether an output is scratch or a deliverable, or a list for `many`.
 struct binding {
+    using list = std::vector<std::string>;
     std::string name;
-    std::variant<std::string, temp_file> value;
+    std::variant<std::string, temp_file, list> value;
     binding(std::string n, const fs::path& p) : name(std::move(n)), value(p.string()) {}
     binding(std::string n, const char* p) : name(std::move(n)), value(std::string(p)) {}
     binding(std::string n, std::string p) : name(std::move(n)), value(std::move(p)) {}
     binding(std::string n, temp_file t) : name(std::move(n)), value(std::move(t)) {}
+    binding(std::string n, const std::vector<fs::path>& paths) : name(std::move(n)), value(list{}) {
+        auto& l = std::get<list>(value);
+        l.reserve(paths.size());
+        for (const auto& p : paths) l.push_back(p.string());
+    }
+    binding(std::string n, list items) : name(std::move(n)), value(std::move(items)) {}
 };
 
 /// Records checks and commands once; exec() replays them into a fresh
@@ -1297,23 +1314,30 @@ public:
     }
 
     /// Replay the recording with slots bound. Binding errors (an unbound
-    /// required slot, or a name no slot uses) start the stage failed; nothing runs.
+    /// required slot, a name no slot uses, or a list bound to a scalar slot and
+    /// vice versa) start the stage failed; nothing runs.
     [[nodiscard]] Outcome exec(std::initializer_list<binding> bindings) const {
         Outcome out(name_, options_);
-        std::unordered_map<std::string, std::variant<std::string, temp_file>> bound;
+        Bound bound;
         for (const auto& b : bindings) bound.emplace(b.name, b.value);
 
-        // Validate before anything runs: every bound name must be a slot.
-        std::unordered_map<std::string, bool> required;  // name -> appears outside every optional group
-        for (const auto& s : steps_) collect(s, required);
-        for (const auto& [n, _] : bound) {
-            if (!required.count(n)) {
+        // Validate before anything runs.
+        std::unordered_map<std::string, Placeholder> placeholders;
+        for (const auto& s : steps_) collect(s, placeholders);
+        for (const auto& [n, v] : bound) {
+            auto it = placeholders.find(n);
+            if (it == placeholders.end()) {
                 out.fail("unknown binding: '" + n + "'");
                 return out;
             }
+            bool is_list = std::holds_alternative<binding::list>(v);
+            if (is_list != it->second.list) {
+                out.fail(std::string(is_list ? "list bound to slot: '" : "scalar bound to list slot: '") + n + "'");
+                return out;
+            }
         }
-        for (const auto& [n, req] : required) {
-            if (req && !bound.count(n) && !defaults_.count(n)) {
+        for (const auto& [n, p] : placeholders) {
+            if (p.required && !bound.count(n) && !defaults_.count(n)) {
                 out.fail("unbound slot: '" + n + "'");
                 return out;
             }
@@ -1324,14 +1348,19 @@ public:
                 case Step::which:
                     out.expect_which(s.text);
                     break;
-                case Step::file: {
-                    auto arg = lower(s.args.front(), bound);
-                    if (arg) std::visit([&](auto&& v) { out.expect_file(v); }, *arg);
-                    break;
-                }
+                case Step::file:
                 case Step::file_pred: {
-                    auto arg = lower(s.args.front(), bound);
-                    if (arg) std::visit([&](auto&& v) { out.expect_file(v, s.pred, s.text); }, *arg);
+                    std::vector<Arg> targets;
+                    append(s.args.front(), bound, targets);
+                    for (const Arg& t : targets) {
+                        const fs::path* p = nullptr;
+                        fs::path text;
+                        if (const auto* tok = std::get_if<temp_file>(&t.value_)) p = out.resolve(*tok);
+                        else p = &(text = std::get<std::string>(t.value_));
+                        if (!p) break;  // resolve() recorded the failure
+                        if (s.kind == Step::file) out.expect_file(*p);
+                        else out.expect_file(*p, s.pred, s.text);
+                    }
                     break;
                 }
                 case Step::command: {
@@ -1369,48 +1398,67 @@ private:
         return steps_.back();
     }
 
-    using Bound = std::unordered_map<std::string, std::variant<std::string, temp_file>>;
+    using Bound = std::unordered_map<std::string, std::variant<std::string, temp_file, binding::list>>;
 
-    /// Record every slot name; `required` is true if it occurs outside all optional groups.
-    void collect(const Step& s, std::unordered_map<std::string, bool>& required) const {
-        for (const auto& a : s.args) collect(a, required, true);
-        if (s.stdout_target) collect(*s.stdout_target, required, true);
+    struct Placeholder {
+        bool required = false;  ///< occurs outside every optional group
+        bool list = false;      ///< declared with many{} rather than slot{}
+    };
+
+    /// Record every placeholder; a name is required if it occurs outside all optional groups.
+    void collect(const Step& s, std::unordered_map<std::string, Placeholder>& out) const {
+        for (const auto& a : s.args) collect(a, out, true);
+        if (s.stdout_target) collect(*s.stdout_target, out, true);
     }
-    void collect(const TArg& a, std::unordered_map<std::string, bool>& required, bool top) const {
+    void collect(const TArg& a, std::unordered_map<std::string, Placeholder>& out, bool top) const {
         if (const auto* s = std::get_if<slot>(&a.value_)) {
             if (s->default_value) defaults_.emplace(s->name, *s->default_value);
-            auto [it, _] = required.try_emplace(s->name, false);
-            if (top) it->second = true;
+            auto& p = out[s->name];
+            p.required = p.required || top;
+        } else if (const auto* m = std::get_if<many>(&a.value_)) {
+            auto& p = out[m->name];
+            p.required = p.required || top;
+            p.list = true;
         } else if (const auto* g = std::get_if<std::shared_ptr<optional>>(&a.value_)) {
-            for (const auto& inner : (*g)->args) collect(inner, required, false);
+            for (const auto& inner : (*g)->args) collect(inner, out, false);
         }
     }
 
-    /// A single (non-group) template argument as the concrete value it stands for.
+    /// A scalar template argument as the concrete value it stands for.
     std::optional<std::variant<std::string, temp_file>> lower(const TArg& a, const Bound& bound) const {
         if (const auto* text = std::get_if<std::string>(&a.value_)) return *text;
         if (const auto* t = std::get_if<temp_file>(&a.value_)) return *t;
         if (const auto* s = std::get_if<slot>(&a.value_)) {
-            if (auto it = bound.find(s->name); it != bound.end()) return it->second;
+            if (auto it = bound.find(s->name); it != bound.end()) {
+                if (const auto* str = std::get_if<std::string>(&it->second)) return *str;
+                if (const auto* tok = std::get_if<temp_file>(&it->second)) return *tok;
+            }
             if (s->default_value) return *s->default_value;
             return std::nullopt;  // only reachable inside an optional group
         }
         return std::nullopt;
     }
 
-    /// Expand one template argument into argv, dropping optional groups with unbound slots.
-    void append(const TArg& a, const Bound& bound, std::vector<Arg>& argv) const {
+    /// Expand one template argument into argv. Lists expand in place; an optional
+    /// group is dropped whole if any placeholder inside it is unbound.
+    bool append(const TArg& a, const Bound& bound, std::vector<Arg>& argv) const {
+        if (const auto* m = std::get_if<many>(&a.value_)) {
+            auto it = bound.find(m->name);
+            if (it == bound.end()) return false;
+            for (const auto& item : std::get<binding::list>(it->second)) argv.emplace_back(item);
+            return true;
+        }
         if (const auto* g = std::get_if<std::shared_ptr<optional>>(&a.value_)) {
             std::vector<Arg> group;
-            for (const auto& inner : (*g)->args) {
-                auto v = lower(inner, bound);
-                if (!v) return;  // an unbound slot drops the whole group
-                std::visit([&](auto&& x) { group.emplace_back(std::move(x)); }, std::move(*v));
-            }
+            for (const auto& inner : (*g)->args)
+                if (!append(inner, bound, group)) return true;  // unbound: drop the group, not an error
             for (auto& x : group) argv.push_back(std::move(x));
-            return;
+            return true;
         }
-        if (auto v = lower(a, bound)) std::visit([&](auto&& x) { argv.emplace_back(std::move(x)); }, std::move(*v));
+        auto v = lower(a, bound);
+        if (!v) return false;
+        std::visit([&](auto&& x) { argv.emplace_back(std::move(x)); }, std::move(*v));
+        return true;
     }
 
     std::string name_;

@@ -249,20 +249,34 @@ int main() {
 
 | Placeholder | Meaning |
 |---|---|
-| `slot{"name"}` | Required; must be bound. |
+| `slot{"name"}` | Required; must be bound to one path or string. |
 | `slot{"name", "default"}` | Uses the default when unbound. |
-| `optional{...}` | An argv group included only when every slot inside it is bound, and dropped whole otherwise. A slot that also appears outside any group stays required. |
+| `many{"name"}` | Required; bound to a `std::vector` of paths that expands in place. In `expect_file` it checks every element. A bound empty list is valid and expands to nothing. |
+| `optional{...}` | An argv group included only when every placeholder inside it is bound, and dropped whole otherwise. A placeholder that also appears outside any group stays required. |
+
+```cpp
+#include <shrn.hpp>
+
+int main() {
+    const auto align_all = shrn::StageTemplate("align all")
+        .expect_file(shrn::many{"reads"}, shrn::file_non_empty, "non-empty")
+        .proc({"minimap2", "-a", shrn::slot{"ref"}, shrn::many{"reads"}, "-o", shrn::slot{"out"}});
+
+    std::vector<std::filesystem::path> reads = {"a.fq", "b.fq", "c.fq"};
+    align_all.exec({{"ref", "ref.fa"}, {"reads", reads}, {"out", "all.sam"}}).or_die_if(true);
+}
+```
 
 Binding mistakes fail at `exec()`, before any command runs: an unbound
-required slot reports `unbound slot: 'name'`, and a binding that no slot uses
-reports `unknown binding: 'name'`. A slot may be bound to a `temp_file` token,
-letting the caller decide per `exec()` whether an output is scratch or a
-deliverable. `proc_to(target, {...})` redirects a command's stdout to a slot or
-temp token. Predicates are stored type-erased; `RunOptions` other than the
-stdout target are fixed when the template is built.
-
-Templates are fixed in shape: a variable-length list of files is not a slot.
-Build such argument vectors in the pipeline and pass them to `proc` directly.
+required placeholder reports `unbound slot: 'name'`, a binding that no
+placeholder uses reports `unknown binding: 'name'`, and binding a list to a
+`slot` or a scalar to a `many` reports the mismatch. A slot may be bound to a
+`temp_file` token, letting the caller decide per `exec()` whether an output is
+scratch or a deliverable; temp tokens inside a template resolve when `exec()`
+runs, so each execution owns its own temp directory. `proc_to(target, {...})`
+redirects a command's stdout to a slot or temp token. Predicates are stored
+type-erased; `RunOptions` other than the stdout target are fixed when the
+template is built.
 
 ## Files
 
@@ -277,7 +291,7 @@ CMake, FetchContent:
 include(FetchContent)
 FetchContent_Declare(shrn
     GIT_REPOSITORY https://github.com/f0t1h/shrn.git
-    GIT_TAG        v0.6.0)
+    GIT_TAG        v0.7.0)
 FetchContent_MakeAvailable(shrn)
 target_link_libraries(your_target PRIVATE shrn::shrn)
 ```

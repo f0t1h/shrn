@@ -1061,6 +1061,52 @@ static void test_stage_templates(const fs::path& dir) {
     }
     CHECK(fs::exists(kept / "k"), "keep_temps carries through exec");
     fs::remove_all(kept);
+
+    // many{} binds a list that expands in place; expect_file over it checks every element.
+    write_file(dir / "tpl_p1", "a");
+    write_file(dir / "tpl_p2", "b");
+    write_file(dir / "tpl_q", "q");
+    write_file(dir / "tpl_blank", "");
+    const std::vector<fs::path> plasmids = {dir / "tpl_p1", dir / "tpl_p2"};
+    const auto propagate = shrn::StageTemplate("propagate")
+                               .expect_file(shrn::slot{"query"}, shrn::file_non_empty, "non-empty")
+                               .expect_file(shrn::many{"plasmids"}, shrn::file_non_empty, "non-empty")
+                               .proc({"sh", "-c", "printf \"%s|\" \"$@\" > \"$0\"", shrn::slot{"out"},
+                                      shrn::slot{"query"}, shrn::many{"plasmids"}, "-t", shrn::slot{"threads", "4"}})
+                               .expect_file(shrn::slot{"out"});
+    CHECK(propagate.exec({{"query", dir / "tpl_q"}, {"plasmids", plasmids}, {"out", dir / "tpl_m1"}}).wait().ok() &&
+              slurp(dir / "tpl_m1") == (dir / "tpl_q").string() + "|" + (dir / "tpl_p1").string() + "|" +
+                                          (dir / "tpl_p2").string() + "|-t|4|",
+          "a list expands in place between scalar slots");
+    CHECK(propagate.exec({{"query", dir / "tpl_q"}, {"plasmids", std::vector<fs::path>{}}, {"out", dir / "tpl_m2"}}).wait().ok() &&
+              slurp(dir / "tpl_m2") == (dir / "tpl_q").string() + "|-t|4|",
+          "a bound empty list expands to nothing");
+    auto element = propagate.exec({{"query", dir / "tpl_q"}, {"plasmids", std::vector<fs::path>{dir / "tpl_p1", dir / "tpl_blank"}},
+                                   {"out", dir / "tpl_m3"}}).wait();
+    CHECK(!element.ok() && element.detail() == "not non-empty: " + (dir / "tpl_blank").string(),
+          "a per-element check names the failing element");
+    CHECK(!fs::exists(dir / "tpl_m3"), "a failed element check runs no command");
+    auto unbound_list = propagate.exec({{"query", dir / "tpl_q"}, {"out", dir / "tpl_m4"}});
+    CHECK(!unbound_list.ok() && unbound_list.detail() == "unbound slot: 'plasmids'", "an unbound list is required");
+    auto scalar_to_list = propagate.exec({{"query", dir / "tpl_q"}, {"plasmids", "one"}, {"out", dir / "tpl_m5"}});
+    CHECK(!scalar_to_list.ok() && scalar_to_list.detail() == "scalar bound to list slot: 'plasmids'",
+          "binding a scalar to many{} fails exec");
+    auto list_to_scalar = propagate.exec({{"query", plasmids}, {"plasmids", plasmids}, {"out", dir / "tpl_m6"}});
+    CHECK(!list_to_scalar.ok() && list_to_scalar.detail() == "list bound to slot: 'query'",
+          "binding a list to slot{} fails exec");
+
+    // many{} inside an optional group: dropped when unbound, present when bound even if empty.
+    const auto extras = shrn::StageTemplate("extras")
+                            .proc({"sh", "-c", "printf \"%s|\" \"$@\" > \"$0\"", shrn::slot{"out"}, "x",
+                                   shrn::optional{"--extra", shrn::many{"more"}}});
+    CHECK(extras.exec({{"out", dir / "tpl_x1"}}).wait().ok() && slurp(dir / "tpl_x1") == "x|",
+          "an optional group with an unbound list is dropped");
+    CHECK(extras.exec({{"out", dir / "tpl_x2"}, {"more", std::vector<fs::path>{dir / "tpl_p1"}}}).wait().ok() &&
+              slurp(dir / "tpl_x2") == "x|--extra|" + (dir / "tpl_p1").string() + "|",
+          "an optional group with a bound list is included");
+    CHECK(extras.exec({{"out", dir / "tpl_x3"}, {"more", std::vector<fs::path>{}}}).wait().ok() &&
+              slurp(dir / "tpl_x3") == "x|--extra|",
+          "a bound empty list keeps its optional group");
 }
 
 int main(int argc, char** argv) {
