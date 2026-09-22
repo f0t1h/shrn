@@ -196,10 +196,9 @@ int main() {
         .expect_file("reads.fq", shrn::file_non_empty, "non-empty")
         .proc({"minimap2", "-a", "ref.fa", "reads.fq", "-o", shrn::temp_file{"aln.sam"}})
         .expect_file(shrn::temp_file{"aln.sam"}, shrn::file_non_empty, "non-empty")
-        .proc({"samtools", "sort", "-o", shrn::temp_file{"aln.bam"}, shrn::temp_file{"aln.sam"}})
-        .proc({"samtools", "index", shrn::temp_file{"aln.bam"}})
-        .expect_file(shrn::temp_file{"aln.bam.bai"})
-        .proc({"cp", shrn::temp_file{"aln.bam"}, "final.bam"})
+        .proc({"samtools", "sort", "-o", "aln.bam", shrn::temp_file{"aln.sam"}})
+        .proc({"samtools", "index", "aln.bam"})
+        .expect_file("aln.bam.bai")
         .or_die_if(true);
 }
 ```
@@ -208,7 +207,7 @@ The directory is created on first use under `$TMPDIR` (or `/tmp`) as
 `shrn_<stage>_<pid>_<uuid>_XXXXXX`, so concurrent runs and same-named stages
 never collide. It is removed when the stage is destroyed. Files inside keep
 the names you gave them, so tools that inspect extensions or write sidecar
-files (`aln.bam.bai` beside `aln.bam`) behave normally. Names are single path
+files (an index beside its BAM) behave normally. Names are single path
 components; separators and `..` fail the stage.
 
 `call(fn, shrn::temp_file{"x"})` passes the resolved path as
@@ -234,7 +233,7 @@ CMake, FetchContent:
 include(FetchContent)
 FetchContent_Declare(shrn
     GIT_REPOSITORY https://github.com/f0t1h/shrn.git
-    GIT_TAG        v0.4.0)
+    GIT_TAG        v0.5.0)
 FetchContent_MakeAvailable(shrn)
 target_link_libraries(your_target PRIVATE shrn::shrn)
 ```
