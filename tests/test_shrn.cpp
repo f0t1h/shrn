@@ -1170,6 +1170,119 @@ static void test_temp_dir_option(const fs::path& dir) {
     CHECK(templated.parent_path() == parent && !fs::exists(templated), "temp_dir flows through StageTemplate");
 }
 
+// Freshness rules on commands
+static void touch_newer(const fs::path& p) {
+    // File mtimes may be coarse; step forward explicitly so "newer" is unambiguous.
+    auto latest = fs::file_time_type::clock::now();
+    std::error_code ec;
+    fs::last_write_time(p, latest + std::chrono::seconds(2), ec);
+}
+
+static void test_freshness(const fs::path& dir) {
+    std::fprintf(stderr, "freshness\n");
+    const fs::path in = dir / "fresh_in", out = dir / "fresh_out", marker = dir / "fresh_ran";
+    write_file(in, "1");
+
+    CHECK(!shrn::fresh({out}, {in}), "a missing output is stale");
+    write_file(out, "o");
+    touch_newer(out);
+    CHECK(shrn::fresh({out}, {in}), "an output newer than every input is fresh");
+    CHECK(shrn::fresh({out}, {}), "with no inputs, an existing output is fresh");
+    CHECK(!shrn::fresh({}, {in}), "no outputs is never fresh");
+    CHECK(!shrn::fresh({out}, {dir / "fresh_missing_input"}), "a missing input is stale");
+    touch_newer(in);
+    CHECK(!shrn::fresh({out}, {in}), "an input newer than an output is stale");
+
+    // Tagged argv: `cp in out` is skipped once out is newer than in.
+    auto ran = [&](bool force) {
+        fs::remove(marker);
+        auto s = shrn::stage("tags", {.force = force})
+                     .proc({"sh", "-c", "cp \"$1\" \"$2\" && touch \"$0\"", marker, shrn::in(in), shrn::out(out)})
+                     .wait();
+        return s.ok() && fs::exists(marker);
+    };
+    CHECK(ran(false), "a stale output runs its command");
+    touch_newer(out);
+    fs::remove(marker);
+    {
+        auto s = shrn::stage("tags").proc({"sh", "-c", "touch \"$0\"", marker, shrn::in(in), shrn::out(out)}).wait();
+        CHECK(s.ok() && !fs::exists(marker), "a fresh output skips its command and the stage stays ok");
+    }
+    CHECK(ran(true), "force runs a command whose outputs are fresh");
+    {
+        auto s = shrn::stage("in only").proc({"sh", "-c", "touch \"$0\"", marker, shrn::in(in)}).wait();
+        CHECK(s.ok() && fs::exists(marker), "in() without out() never skips");
+    }
+    fs::remove(marker);
+    {
+        auto s = shrn::stage("exists").proc({"sh", "-c", "touch \"$0\"", marker, shrn::out(out)}).wait();
+        CHECK(s.ok() && !fs::exists(marker), "out() alone is skip-if-exists");
+    }
+
+    // Off-argv dependencies through RunOptions, on both proc overloads.
+    fs::remove(marker);
+    touch_newer(out);
+    shrn::RunOptions deps;
+    deps.inputs = {in};
+    deps.outputs = {out};
+    CHECK(shrn::stage("opts").proc(std::vector<std::string>{"touch", marker.string()}, deps).wait().ok() && !fs::exists(marker),
+          "RunOptions outputs/inputs guard the vector overload");
+    CHECK(shrn::stage("opts").proc({"touch", marker}, deps).wait().ok() && !fs::exists(marker),
+          "RunOptions outputs/inputs guard the braced overload");
+    touch_newer(in);
+    CHECK(shrn::stage("opts").proc({"touch", marker}, deps).wait().ok() && fs::exists(marker),
+          "a newer off-argv input reruns the command");
+    touch_newer(out);
+
+    fs::remove(marker);
+    auto two = shrn::stage("two")
+                   .proc({"sh", "-c", "exit 1", shrn::in(in), shrn::out(out)})
+                   .proc({"touch", marker})
+                   .wait();
+    CHECK(two.ok() && fs::exists(marker), "a skipped command does not skip later commands");
+
+    int calls = 0;
+    fs::path seen;
+    auto tagged_call = shrn::stage("call tags").call([&](const fs::path& o, const fs::path& i) { ++calls; seen = o; return i.empty(); },
+                                                     shrn::out(out), shrn::in(in));
+    CHECK(tagged_call.ok() && calls == 0, "call() skips when its out() is fresh");
+    touch_newer(in);
+    tagged_call = shrn::stage("call tags").call([&](const fs::path& o, const fs::path& i) { ++calls; seen = o; return i.empty(); },
+                                                shrn::out(out), shrn::in(in));
+    CHECK(tagged_call.ok() && calls == 1 && seen == out, "call() runs when stale and receives tagged arguments as paths");
+    auto scratch_rule = shrn::stage("temp tags")
+                            .proc({"sh", "-c", "printf x > \"$0\"", shrn::temp_file{"scratch"}})
+                            .call([&](const fs::path&) { ++calls; return 0; }, shrn::out(shrn::temp_file{"scratch"}))
+                            .wait();
+    CHECK(scratch_rule.ok() && calls == 1, "temp tokens can be tagged");
+    static_assert(!std::is_constructible_v<shrn::Arg, shrn::in<shrn::slot>>, "tagged placeholders stay template-only");
+
+    // Template tags bind placeholders at launch and take part in binding validation.
+    const fs::path a = dir / "fresh_a", b = dir / "fresh_b", prod = dir / "fresh_prod";
+    write_file(a, "a");
+    write_file(b, "b");
+    const std::vector<fs::path> srcs = {a, b};
+    const auto build = shrn::StageTemplate("build")
+                           .proc({"sh", "-c", "cat \"$@\" > \"$0\"", shrn::out(shrn::slot{"prod"}), shrn::in(shrn::many{"srcs"})});
+    CHECK(build.launch({{"prod", prod}, {"srcs", srcs}}).wait().ok() && slurp(prod) == "ab", "a stale template command runs");
+    write_file(prod, "kept");
+    touch_newer(prod);
+    CHECK(build.launch({{"prod", prod}, {"srcs", srcs}}).wait().ok() && slurp(prod) == "kept", "a fresh template command skips");
+    touch_newer(a);
+    CHECK(build.launch({{"prod", prod}, {"srcs", srcs}}).wait().ok() && slurp(prod) == "ab", "a newer list input reruns the template command");
+    auto unbound = build.launch({{"prod", prod}});
+    CHECK(!unbound.ok() && unbound.detail() == "unbound slot: 'srcs'", "tagged placeholders are validated like any other");
+    write_file(prod, "x");
+    touch_newer(prod);
+    const auto forced = shrn::StageTemplate("forced", {.force = true})
+                            .proc({"sh", "-c", "printf F > \"$0\"", shrn::out(shrn::slot{"prod"})});
+    CHECK(forced.launch({{"prod", prod}}).wait().ok() && slurp(prod) == "F", "force on a template overrides its tags");
+    int tcalls = 0;
+    const auto tcall = shrn::StageTemplate("tcall").call([&](const fs::path&) { ++tcalls; return 0; }, shrn::out(shrn::slot{"p"}));
+    CHECK(tcall.launch({{"p", prod}}).ok() && tcalls == 0, "a template call() honors out() at launch");
+    CHECK(tcall.launch({{"p", dir / "fresh_absent"}}).ok() && tcalls == 1, "a template call() runs when its out() is missing");
+}
+
 int main(int argc, char** argv) {
     init_self_exe(argv[0]);
     if (argc >= 2) {
@@ -1196,6 +1309,7 @@ int main(int argc, char** argv) {
     test_outcome_temps();
     test_stage_templates(root);
     test_temp_dir_option(root);
+    test_freshness(root);
 
     std::error_code ec;
     fs::remove_all(root, ec);

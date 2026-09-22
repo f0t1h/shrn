@@ -309,6 +309,62 @@ int main() {
 Predicates and call bodies are stored type-erased; `RunOptions` other than the
 stdout target are fixed when the template is built.
 
+### Freshness
+
+Tag the files a command reads and writes where they appear in argv:
+`in(path)` and `out(path)`. A command with any `out` is skipped when every
+output exists and none is older than any `in`; the skip covers just that
+command, and later commands and checks proceed. `out` alone is skip-if-exists;
+`in` alone never skips. `shrn::fresh(outputs, inputs)` is the predicate itself.
+A missing input counts as stale, so the command runs and its own checks report
+the problem. `StageOptions{.force = true}` runs every command in the stage
+regardless.
+
+Tags wrap paths, temp tokens, and in templates `slot`/`many` placeholders,
+which are bound at launch like any other. `call()` arguments may be tagged
+too; they reach the function as `const std::filesystem::path&`. Files a tool
+reads or writes without naming them in argv (index sidecars, for example) go
+in `RunOptions::inputs` / `RunOptions::outputs`.
+
+```cpp
+#include <shrn.hpp>
+
+int main() {
+    shrn::stage("sort and index")
+        .expect_file("input.txt", shrn::file_non_empty, "non-empty")
+        .proc({"sort", shrn::in("input.txt"), "-o", shrn::out("sorted.txt")})  // skipped while sorted.txt is newer
+        .proc({"gzip", "-kf", shrn::in("sorted.txt")}, {.outputs = {"sorted.txt.gz"}})  // output not named in argv
+        .expect_file("sorted.txt.gz", shrn::file_non_empty, "non-empty")
+        .or_die_if(true);
+}
+```
+
+The predicate alone lets a program rebuild itself when its sources change, in
+the style of `nob.h`. Compile into a stage temp, replace the running binary
+(it cannot be overwritten in place), and re-exec:
+
+```cpp
+#include <shrn.hpp>
+#include <unistd.h>
+
+int main(int, char** argv) {
+    const std::filesystem::path exe = std::filesystem::canonical("/proc/self/exe");
+    if (!shrn::fresh({exe}, {"script.cpp", "include/shrn.hpp"})) {
+        shrn::stage("rebuild")
+            .proc({"c++", "-std=c++20", "-pthread", "-Iinclude", "script.cpp", "-o", shrn::temp_file{"fresh"}})
+            .call([&](const std::filesystem::path& fresh_binary) {
+                std::filesystem::rename(fresh_binary, exe);
+                return 0;
+            }, shrn::temp_file{"fresh"})
+            .or_die_if(true);
+        execv(exe.c_str(), argv);  // start over in the rebuilt program
+        return 1;
+    }
+    // ... the program itself ...
+    return 0;
+}
+```
+
 ## Files
 
 - `file_readable` and `file_non_empty` return booleans.
@@ -322,7 +378,7 @@ CMake, FetchContent:
 include(FetchContent)
 FetchContent_Declare(shrn
     GIT_REPOSITORY https://github.com/f0t1h/shrn.git
-    GIT_TAG        v0.9.0)
+    GIT_TAG        v0.10.0)
 FetchContent_MakeAvailable(shrn)
 target_link_libraries(your_target PRIVATE shrn::shrn)
 ```

@@ -4,6 +4,7 @@
 #ifndef SHRN_HPP
 #define SHRN_HPP
 
+#include <algorithm>
 #include <cctype>
 #include <cerrno>
 #include <chrono>
@@ -280,11 +281,13 @@ inline SpawnHook& default_spawn_hook() {
 }
 
 struct RunOptions {
-    std::optional<fs::path> workdir;              ///< chdir before exec
-    bool capture_stderr = true;                   ///< collect child's stderr into RunResult
-    bool inherit_stdout = true;                   ///< false → /dev/null (ignored when stdout_file set)
-    std::optional<fs::path> stdout_file;          ///< create/truncate; relative to caller, not workdir
-    SpawnHook on_spawn;                           ///< overrides default_spawn_hook() for this run
+    std::optional<fs::path> workdir = std::nullopt;      ///< chdir before exec
+    bool capture_stderr = true;                          ///< collect child's stderr into RunResult
+    bool inherit_stdout = true;                          ///< false → /dev/null (ignored when stdout_file set)
+    std::optional<fs::path> stdout_file = std::nullopt;  ///< create/truncate; relative to caller, not workdir
+    SpawnHook on_spawn = nullptr;                        ///< overrides default_spawn_hook() for this run
+    std::vector<fs::path> inputs = {};                   ///< files read but not named in argv (freshness only; ignored by run())
+    std::vector<fs::path> outputs = {};                  ///< files written but not named in argv (freshness only; ignored by run())
 };
 
 struct RunResult {
@@ -809,13 +812,41 @@ struct temp_file {
 struct slot;
 struct optional;
 
-/// One argv element for proc(): plain text or a stage temp token.
+/// Freshness roles: mark an argv element as a file the command reads or writes.
+/// A command with any `out` is skipped when every output exists and none is
+/// older than any `in` (see fresh()), unless the stage was created with force.
+template <class T>
+struct in {
+    T value;
+    explicit in(T v) : value(std::move(v)) {}
+};
+template <class T>
+struct out {
+    T value;
+    explicit out(T v) : value(std::move(v)) {}
+};
+
+namespace detail {
+enum class Role { none, input, output };
+template <class T> struct tag { static constexpr Role role = Role::none; };
+template <class T> struct tag<in<T>> { using inner = T; static constexpr Role role = Role::input; };
+template <class T> struct tag<out<T>> { using inner = T; static constexpr Role role = Role::output; };
+template <class T> constexpr Role role_of = tag<std::remove_cvref_t<T>>::role;
+template <class T> constexpr bool tagged = role_of<T> != Role::none;
+}  // namespace detail
+
+/// One argv element for proc(): plain text or a stage temp token, optionally
+/// tagged with in()/out().
 class Arg {
 public:
     Arg(const char* text) : value_(std::string(text)) {}
     Arg(std::string text) : value_(std::move(text)) {}
     Arg(const fs::path& path) : value_(path.string()) {}
     Arg(temp_file token) : value_(std::move(token)) {}
+    template <class T> requires std::is_constructible_v<Arg, T>
+    Arg(in<T> t) : Arg(std::move(t.value)) { role_ = detail::Role::input; }
+    template <class T> requires std::is_constructible_v<Arg, T>
+    Arg(out<T> t) : Arg(std::move(t.value)) { role_ = detail::Role::output; }
     // Placeholders belong to StageTemplate, which records instead of executing.
     Arg(slot) = delete;      ///< use shrn::StageTemplate for stages with slots
     Arg(optional) = delete;  ///< use shrn::StageTemplate for stages with optional groups
@@ -824,11 +855,88 @@ private:
     friend class Outcome;
     friend class StageTemplate;
     std::variant<std::string, temp_file> value_;
+    detail::Role role_ = detail::Role::none;
 };
 
+// Placeholders (used by StageTemplate; declared here so rules can name them)
+
+/// A placeholder in a template, bound to a path at launch. A slot with
+/// a default is satisfied by the default when left unbound; one without is
+/// required unless it appears only inside optional groups.
+struct slot {
+    std::string name;
+    std::optional<std::string> default_value;
+    explicit slot(std::string n) : name(std::move(n)) {}
+    slot(std::string n, std::string d) : name(std::move(n)), default_value(std::move(d)) {}
+};
+
+/// A list placeholder, bound to a vector of paths at launch. It expands in
+/// place in argv and, in expect_file, checks every element. Required unless
+/// it appears only inside optional groups; a bound empty list is valid.
+struct many {
+    std::string name;
+    explicit many(std::string n) : name(std::move(n)) {}
+};
+
+class TArg;
+
+/// An argv fragment included whole when every slot inside it is bound (or
+/// defaulted), and dropped whole otherwise: `optional{"-2", slot{"r2"}}`.
+struct optional {
+    std::vector<TArg> args;
+    optional(std::initializer_list<TArg> a);
+};
+
+/// One template argv element: text, a temp token, a slot, a list, or an optional
+/// group, optionally tagged with in()/out().
+class TArg {
+public:
+    TArg(const char* text) : value_(std::string(text)) {}
+    TArg(std::string text) : value_(std::move(text)) {}
+    TArg(const fs::path& path) : value_(path.string()) {}
+    TArg(temp_file token) : value_(std::move(token)) {}
+    TArg(slot s) : value_(std::move(s)) {}
+    TArg(many m) : value_(std::move(m)) {}
+    TArg(optional group) : value_(std::make_shared<optional>(std::move(group))) {}
+    template <class T> requires std::is_constructible_v<TArg, T>
+    TArg(in<T> t) : TArg(std::move(t.value)) { role_ = detail::Role::input; }
+    template <class T> requires std::is_constructible_v<TArg, T>
+    TArg(out<T> t) : TArg(std::move(t.value)) { role_ = detail::Role::output; }
+
+private:
+    friend class Outcome;
+    friend class StageTemplate;
+    std::variant<std::string, temp_file, slot, many, std::shared_ptr<optional>> value_;
+    detail::Role role_ = detail::Role::none;
+};
+
+inline optional::optional(std::initializer_list<TArg> a) : args(a) {}
+
+// Freshness
+
+/// True when every output exists and none is older than any input. A missing
+/// input or an empty output list counts as stale, so the command runs and its
+/// own checks report the problem.
+[[nodiscard]] inline bool fresh(const std::vector<fs::path>& outputs, const std::vector<fs::path>& inputs) noexcept {
+    if (outputs.empty()) return false;
+    std::error_code ec;
+    fs::file_time_type oldest_output = fs::file_time_type::max();
+    for (const auto& o : outputs) {
+        auto t = fs::last_write_time(o, ec);
+        if (ec) return false;
+        oldest_output = std::min(oldest_output, t);
+    }
+    for (const auto& i : inputs) {
+        auto t = fs::last_write_time(i, ec);
+        if (ec || t > oldest_output) return false;
+    }
+    return true;
+}
+
 struct StageOptions {
-    bool keep_temps = false;              ///< leave the stage temp directory in place on destruction
-    std::optional<fs::path> temp_dir;     ///< parent for the stage temp directory; default $TMPDIR or /tmp
+    bool keep_temps = false;                          ///< leave the stage temp directory in place on destruction
+    std::optional<fs::path> temp_dir = std::nullopt;  ///< parent for the stage temp directory; default $TMPDIR or /tmp
+    bool force = false;                               ///< run every command even when its outputs are fresh
 };
 
 /// Ordered asynchronous commands and checks; skip later operations after failure.
@@ -847,26 +955,25 @@ public:
     }
 
 private:
-    /// What a call() argument becomes at the callee: temp tokens turn into paths.
+    /// What a call() argument becomes at the callee: temp tokens and in()/out()
+    /// tags turn into paths.
     template <class T>
-    using resolved_t = std::conditional_t<std::is_same_v<std::remove_cvref_t<T>, temp_file>, const fs::path&, T>;
+    using resolved_t = std::conditional_t<std::is_same_v<std::remove_cvref_t<T>, temp_file> || detail::tagged<T>,
+                                          const fs::path&, T>;
 
 public:
 
     /// Wait for the previous command, then start args without waiting for completion.
+    /// Skipped when opts.outputs are fresh relative to opts.inputs.
     Outcome& proc(const std::vector<std::string>& args, const RunOptions& opts = {}) & {
-        if (!ok()) return *this;
-        cmd_ = args.empty() ? std::string() : args.front();
-        auto child = spawn(args, opts, name_);
-        if (!child.error().empty()) fail("cannot execute: " + child.error());
-        else pending_.emplace(std::move(child));
-        return *this;
+        if (!ok() || skip_fresh(opts.outputs, opts.inputs)) return *this;
+        return start(args, opts);
     }
     Outcome&& proc(const std::vector<std::string>& args, const RunOptions& opts = {}) && {
         return std::move(proc(args, opts));
     }
 
-    /// Braced argument lists may mix text with temp_file tokens.
+    /// Braced argument lists may mix text with temp_file tokens and in()/out() tags.
     Outcome& proc(std::initializer_list<Arg> args, const RunOptions& opts = {}) & {
         return proc_args(args.begin(), args.end(), opts);
     }
@@ -875,7 +982,8 @@ public:
     }
 
     /// Wait for the previous command, then invoke on the caller's thread.
-    /// temp_file arguments are resolved to `const fs::path&` before the call.
+    /// temp_file and in()/out() arguments reach `fn` as `const fs::path&`;
+    /// the call is skipped when its out() paths are fresh relative to its in() paths.
     template <class F, class... Args>
         requires std::is_invocable_r_v<int, F, resolved_t<Args>...>
     Outcome& call(F&& fn, Args&&... args) & {
@@ -883,6 +991,9 @@ public:
         cmd_.clear();
         bool resolvable = (resolve_arg(args) && ...);
         if (!resolvable) return *this;  // resolve_arg() recorded the failure
+        std::vector<fs::path> outputs, inputs;
+        (note_role(args, outputs, inputs), ...);
+        if (skip_fresh(outputs, inputs)) return *this;
         int status = std::invoke(std::forward<F>(fn), forward_arg<Args>(args)...);
         if (status != 0) fail("function returned code " + std::to_string(status));
         return *this;
@@ -1130,11 +1241,28 @@ private:
 
     // --- stage temp files -------------------------------------------------
 
-    /// Shared by the braced proc() and template replay: resolve tokens, then spawn.
+    /// True when a command should be skipped: it declares outputs, they are
+    /// fresh relative to its inputs, and the stage was not created with force.
+    bool skip_fresh(const std::vector<fs::path>& outputs, const std::vector<fs::path>& inputs) const noexcept {
+        return !options_.force && fresh(outputs, inputs);
+    }
+
+    /// Spawn without any freshness check.
+    Outcome& start(const std::vector<std::string>& args, const RunOptions& opts) {
+        cmd_ = args.empty() ? std::string() : args.front();
+        auto child = spawn(args, opts, name_);
+        if (!child.error().empty()) fail("cannot execute: " + child.error());
+        else pending_.emplace(std::move(child));
+        return *this;
+    }
+
+    /// Shared by the braced proc() and template replay: resolve tokens, gather
+    /// tagged paths plus opts.inputs/outputs, then spawn unless fresh.
     Outcome& proc_args(const Arg* first, const Arg* last, const RunOptions& opts) {
         if (!ok()) return *this;
         std::vector<std::string> resolved;
         resolved.reserve(static_cast<std::size_t>(last - first));
+        std::vector<fs::path> outputs = opts.outputs, inputs = opts.inputs;
         for (const Arg* a = first; a != last; ++a) {
             if (const auto* token = std::get_if<temp_file>(&a->value_)) {
                 const fs::path* p = resolve(*token);
@@ -1143,8 +1271,11 @@ private:
             } else {
                 resolved.push_back(std::get<std::string>(a->value_));
             }
+            if (a->role_ == detail::Role::output) outputs.emplace_back(resolved.back());
+            else if (a->role_ == detail::Role::input) inputs.emplace_back(resolved.back());
         }
-        return proc(resolved, opts);
+        if (skip_fresh(outputs, inputs)) return *this;
+        return start(resolved, opts);
     }
 
     /// Resolve a token to its path inside the stage temp directory, creating the
@@ -1171,15 +1302,29 @@ private:
         return &it->second;
     }
 
-    /// call() support: non-token arguments always resolve; tokens must resolve.
+    /// call() support: tokens must resolve (also inside in()/out()); everything else always does.
     template <class T>
     bool resolve_arg(T& arg) {
         if constexpr (std::is_same_v<std::remove_cvref_t<T>, temp_file>) return resolve(arg) != nullptr;
+        else if constexpr (detail::tagged<T>) return resolve_arg(arg.value);
         else return true;
+    }
+    /// The path a token or tagged argument stands for; resolve_arg() has already succeeded.
+    /// Tokens yield a reference into the stage's table, other tagged values a fresh path.
+    template <class T>
+    decltype(auto) path_of(T& arg) {
+        if constexpr (std::is_same_v<std::remove_cvref_t<T>, temp_file>) return static_cast<const fs::path&>(*resolve(arg));
+        else if constexpr (detail::tagged<T>) return path_of(arg.value);
+        else return fs::path(arg);
+    }
+    template <class T>
+    void note_role(T& arg, std::vector<fs::path>& outputs, std::vector<fs::path>& inputs) {
+        if constexpr (detail::role_of<T> == detail::Role::output) outputs.push_back(path_of(arg));
+        else if constexpr (detail::role_of<T> == detail::Role::input) inputs.push_back(path_of(arg));
     }
     template <class T, class U>
     decltype(auto) forward_arg(U& arg) {
-        if constexpr (std::is_same_v<std::remove_cvref_t<T>, temp_file>) return static_cast<const fs::path&>(*resolve(arg));
+        if constexpr (std::is_same_v<std::remove_cvref_t<T>, temp_file> || detail::tagged<T>) return path_of(arg);
         else return std::forward<T>(arg);
     }
 
@@ -1207,51 +1352,6 @@ private:
 }
 
 // StageTemplate: a recorded stage with path placeholders
-
-/// A placeholder in a template, bound to a path at launch. A slot with
-/// a default is satisfied by the default when left unbound; one without is
-/// required unless it appears only inside optional groups.
-struct slot {
-    std::string name;
-    std::optional<std::string> default_value;
-    explicit slot(std::string n) : name(std::move(n)) {}
-    slot(std::string n, std::string d) : name(std::move(n)), default_value(std::move(d)) {}
-};
-
-/// A list placeholder, bound to a vector of paths at launch. It expands in
-/// place in argv and, in expect_file, checks every element. Required unless
-/// it appears only inside optional groups; a bound empty list is valid.
-struct many {
-    std::string name;
-    explicit many(std::string n) : name(std::move(n)) {}
-};
-
-class TArg;
-
-/// An argv fragment included whole when every slot inside it is bound (or
-/// defaulted), and dropped whole otherwise: `optional{"-2", slot{"r2"}}`.
-struct optional {
-    std::vector<TArg> args;
-    optional(std::initializer_list<TArg> a);
-};
-
-/// One template argv element: text, a temp token, a slot, a list, or an optional group.
-class TArg {
-public:
-    TArg(const char* text) : value_(std::string(text)) {}
-    TArg(std::string text) : value_(std::move(text)) {}
-    TArg(const fs::path& path) : value_(path.string()) {}
-    TArg(temp_file token) : value_(std::move(token)) {}
-    TArg(slot s) : value_(std::move(s)) {}
-    TArg(many m) : value_(std::move(m)) {}
-    TArg(optional group) : value_(std::make_shared<optional>(std::move(group))) {}
-
-private:
-    friend class StageTemplate;
-    std::variant<std::string, temp_file, slot, many, std::shared_ptr<optional>> value_;
-};
-
-inline optional::optional(std::initializer_list<TArg> a) : args(a) {}
 
 /// A binding target: a concrete path, a temp token so the caller decides at
 /// launch whether an output is scratch or a deliverable, or a list for `many`.
@@ -1423,7 +1523,7 @@ public:
                     break;
                 }
                 case Step::function: {
-                    std::vector<fs::path> paths;
+                    std::vector<fs::path> paths, outputs, inputs;
                     paths.reserve(s.args.size());
                     bool resolved = true;
                     for (const auto& a : s.args) {
@@ -1440,8 +1540,10 @@ public:
                         } else {
                             paths.emplace_back(std::get<std::string>(*v));
                         }
+                        if (a.role_ == detail::Role::output) outputs.push_back(paths.back());
+                        else if (a.role_ == detail::Role::input) inputs.push_back(paths.back());
                     }
-                    if (resolved) out.call(s.fn, paths);
+                    if (resolved && !out.skip_fresh(outputs, inputs)) out.call(s.fn, paths);
                     break;
                 }
             }
@@ -1460,13 +1562,13 @@ private:
         std::function<int(const std::vector<fs::path>&)> fn;  ///< call() step body
     };
 
+    using Bound = std::unordered_map<std::string, std::variant<std::string, temp_file, binding::list>>;
+
     Step& add(Step::Kind kind) {
         steps_.push_back(Step{});
         steps_.back().kind = kind;
         return steps_.back();
     }
-
-    using Bound = std::unordered_map<std::string, std::variant<std::string, temp_file, binding::list>>;
 
     struct Placeholder {
         bool required = false;  ///< occurs outside every optional group
@@ -1513,7 +1615,7 @@ private:
         if (const auto* m = std::get_if<many>(&a.value_)) {
             auto it = bound.find(m->name);
             if (it == bound.end()) return false;
-            for (const auto& item : std::get<binding::list>(it->second)) argv.emplace_back(item);
+            for (const auto& item : std::get<binding::list>(it->second)) argv.emplace_back(item).role_ = a.role_;
             return true;
         }
         if (const auto* g = std::get_if<std::shared_ptr<optional>>(&a.value_)) {
@@ -1525,7 +1627,7 @@ private:
         }
         auto v = lower(a, bound);
         if (!v) return false;
-        std::visit([&](auto&& x) { argv.emplace_back(std::move(x)); }, std::move(*v));
+        std::visit([&](auto&& x) { argv.emplace_back(std::move(x)).role_ = a.role_; }, std::move(*v));
         return true;
     }
 
