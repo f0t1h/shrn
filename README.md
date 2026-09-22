@@ -213,7 +213,9 @@ components; separators and `..` fail the stage.
 `call(fn, shrn::temp_file{"x"})` passes the resolved path as
 `const std::filesystem::path&`. `temp_path("x")` returns it directly, for
 example to hand a result to a later stage; a stage joined with `after` outlives
-the reference. Tokens are stage-local and never resolve across stages.
+the reference. `work_dir()` returns a pointer to the stage's temp directory, or
+null if no temp has been used; it never creates anything. Tokens are
+stage-local and never resolve across stages.
 
 `StageOptions` control where temps live and whether they survive:
 `shrn::stage("map reads", {.keep_temps = true, .temp_dir = out / "tmp"})`.
@@ -320,7 +322,7 @@ CMake, FetchContent:
 include(FetchContent)
 FetchContent_Declare(shrn
     GIT_REPOSITORY https://github.com/f0t1h/shrn.git
-    GIT_TAG        v0.8.0)
+    GIT_TAG        v0.9.0)
 FetchContent_MakeAvailable(shrn)
 target_link_libraries(your_target PRIVATE shrn::shrn)
 ```

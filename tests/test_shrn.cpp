@@ -936,8 +936,14 @@ static void test_outcome_temps() {
               "the stage temp directory is named after the stage");
         CHECK(s.temp_path("aln.sam") == dir / "aln.sam" && s.temp_path("aln.bam") == dir / "aln.bam",
               "temp_path() exposes the resolved paths");
+        CHECK(s.work_dir() && *s.work_dir() == dir, "work_dir() reports the stage temp directory");
     }
     CHECK(!fs::exists(dir), "the stage destructor removes its temp directory");
+    {
+        auto untouched = shrn::stage("no temps").proc({"true"}).wait();
+        CHECK(untouched.ok() && untouched.work_dir() == nullptr, "work_dir() is null until a temp is used");
+        CHECK(untouched.work_dir() == nullptr, "querying work_dir() creates nothing");
+    }
 
     // keep_temps leaves the directory in place.
     fs::path kept;

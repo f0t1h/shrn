@@ -901,6 +901,12 @@ public:
         return p ? *p : none;
     }
 
+    /// The stage's temp directory, or null if no temp file has been used yet.
+    /// Never creates anything; use temp_path() to resolve a file.
+    [[nodiscard]] const fs::path* work_dir() const noexcept {
+        return temp_dir_ ? &temp_dir_->path() : nullptr;
+    }
+
     /// Join all prerequisites, preserving the first failure in argument order.
     template <class... Stages>
         requires (std::is_same_v<Stages, Outcome> && ...)
