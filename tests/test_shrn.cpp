@@ -1107,6 +1107,61 @@ static void test_stage_templates(const fs::path& dir) {
     CHECK(extras.launch({{"out", dir / "tpl_x3"}, {"more", std::vector<fs::path>{}}}).wait().ok() &&
               slurp(dir / "tpl_x3") == "x|--extra|",
           "a bound empty list keeps its optional group");
+
+    // A template call() step receives placeholder arguments as resolved paths.
+    const auto filter = shrn::StageTemplate("filter")
+                            .call([](const fs::path& scratch, const fs::path& tag) {
+                                write_file(scratch, "filtered:" + tag.string());
+                                return 0;
+                            }, shrn::temp_file{"filtered"}, shrn::slot{"tag"})
+                            .expect_file(shrn::temp_file{"filtered"}, shrn::file_non_empty, "non-empty")
+                            .proc({"cp", shrn::temp_file{"filtered"}, shrn::slot{"out"}});
+    CHECK(filter.launch({{"tag", "abc"}, {"out", dir / "tpl_call_out"}}).wait().ok() &&
+              slurp(dir / "tpl_call_out") == "filtered:abc",
+          "a template call() resolves temp tokens and slots to paths");
+    auto failing = shrn::StageTemplate("failing").call([](const fs::path&) { return 4; }, shrn::slot{"p"}).launch({{"p", "x"}});
+    CHECK(!failing.ok() && failing.detail() == "function returned code 4", "a nonzero template call() fails the stage");
+    auto list_arg = shrn::StageTemplate("list arg").call([](const fs::path&) { return 0; }, shrn::many{"xs"})
+                        .launch({{"xs", std::vector<fs::path>{dir / "tpl_p1"}}});
+    CHECK(!list_arg.ok() && list_arg.detail().find("call() arguments must be") != std::string::npos,
+          "a list placeholder is rejected as a call() argument");
+}
+
+// Stage temps placed under a caller-chosen parent directory
+static void test_temp_dir_option(const fs::path& dir) {
+    std::fprintf(stderr, "temp_dir option\n");
+    const fs::path parent = dir / "custom" / "tmp";  // parents must be created on demand
+
+    fs::path placed;
+    {
+        auto s = shrn::stage("placed", {.temp_dir = parent}).proc({"touch", shrn::temp_file{"f"}}).wait();
+        CHECK(s.ok(), "a stage with temp_dir runs");
+        placed = s.temp_path("f").parent_path();
+        CHECK(placed.parent_path() == parent && fs::exists(placed / "f"),
+              "the stage temp directory is created under temp_dir");
+        CHECK(placed.filename().string().rfind("shrn_placed_", 0) == 0, "temp_dir keeps the unique directory name");
+    }
+    CHECK(!fs::exists(placed) && fs::is_directory(parent), "the stage directory is removed; the parent stays");
+
+    fs::path kept;
+    {
+        auto k = shrn::stage("kept", {.keep_temps = true, .temp_dir = parent}).proc({"touch", shrn::temp_file{"k"}}).wait();
+        kept = k.temp_path("k").parent_path();
+    }
+    CHECK(fs::exists(kept / "k") && kept.parent_path() == parent, "keep_temps preserves the directory under temp_dir");
+
+    write_file(dir / "not_a_dir", "x");
+    auto bad = shrn::stage("bad parent", {.temp_dir = dir / "not_a_dir" / "sub"}).proc({"touch", shrn::temp_file{"z"}});
+    CHECK(!bad.ok() && bad.detail().find("cannot create temp dir") != std::string::npos,
+          "an unusable temp_dir fails the stage before any command runs");
+
+    fs::path templated;
+    {
+        auto t = shrn::StageTemplate("templated", {.temp_dir = parent}).proc({"touch", shrn::temp_file{"t"}}).launch({}).wait();
+        CHECK(t.ok(), "a template with temp_dir launches");
+        templated = t.temp_path("t").parent_path();
+    }
+    CHECK(templated.parent_path() == parent && !fs::exists(templated), "temp_dir flows through StageTemplate");
 }
 
 int main(int argc, char** argv) {
@@ -1134,6 +1189,7 @@ int main(int argc, char** argv) {
     test_outcome_async(root);
     test_outcome_temps();
     test_stage_templates(root);
+    test_temp_dir_option(root);
 
     std::error_code ec;
     fs::remove_all(root, ec);

@@ -215,10 +215,14 @@ components; separators and `..` fail the stage.
 example to hand a result to a later stage; a stage joined with `after` outlives
 the reference. Tokens are stage-local and never resolve across stages.
 
-Pass `{.keep_temps = true}` to keep the directory:
-`shrn::stage("map reads", {.keep_temps = true})`. On a fatal `or_die_if(true)`
-the process exits without running destructors; the directory survives and its
-path is printed with the error so the artifacts can be inspected.
+`StageOptions` control where temps live and whether they survive:
+`shrn::stage("map reads", {.keep_temps = true, .temp_dir = out / "tmp"})`.
+`temp_dir` is the parent under which the stage's unique directory is created
+(missing parents are made on demand; the default is `$TMPDIR` or `/tmp`).
+`keep_temps` leaves the directory in place when the stage is destroyed. On a
+fatal `or_die_if(true)` the process exits without running destructors; the
+directory survives regardless and its path is printed with the error so the
+artifacts can be inspected.
 
 ### Stage templates
 
@@ -274,9 +278,34 @@ placeholder uses reports `unknown binding: 'name'`, and binding a list to a
 `temp_file` token, letting the caller decide per `launch()` whether an output is
 scratch or a deliverable; temp tokens inside a template resolve when `launch()`
 runs, so each execution owns its own temp directory. `proc_to(target, {...})`
-redirects a command's stdout to a slot or temp token. Predicates are stored
-type-erased; `RunOptions` other than the stdout target are fixed when the
-template is built.
+redirects a command's stdout to a slot or temp token.
+
+`call(fn, args...)` records a function step. Each argument is a placeholder,
+temp token, or path, and reaches `fn` as a resolved `const std::filesystem::path&`
+when the stage launches; any other state is captured by `fn`, which must be
+copyable. Lists and optional groups are not call arguments. This is how an
+in-process step feeds a following command through a stage temp:
+
+```cpp
+#include <shrn.hpp>
+#include <fstream>
+
+int main() {
+    const auto filter_then_align = shrn::StageTemplate("filter and align")
+        .call([](const std::filesystem::path& filtered) {
+            std::ofstream out(filtered);  // any in-process step that produces a file
+            out << "@r1\nACGTACGT\n+\nIIIIIIII\n";
+            return out ? 0 : 1;
+        }, shrn::temp_file{"filtered.fq"})
+        .expect_file(shrn::temp_file{"filtered.fq"}, shrn::file_non_empty, "non-empty")
+        .proc({"minimap2", "-a", shrn::slot{"ref"}, shrn::temp_file{"filtered.fq"}, "-o", shrn::slot{"out"}});
+
+    filter_then_align.launch({{"ref", "ref.fa"}, {"out", "aln.sam"}}).or_die_if(true);
+}
+```
+
+Predicates and call bodies are stored type-erased; `RunOptions` other than the
+stdout target are fixed when the template is built.
 
 ## Files
 
@@ -291,7 +320,7 @@ CMake, FetchContent:
 include(FetchContent)
 FetchContent_Declare(shrn
     GIT_REPOSITORY https://github.com/f0t1h/shrn.git
-    GIT_TAG        v0.7.0)
+    GIT_TAG        v0.8.0)
 FetchContent_MakeAvailable(shrn)
 target_link_libraries(your_target PRIVATE shrn::shrn)
 ```

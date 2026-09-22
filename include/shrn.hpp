@@ -121,10 +121,17 @@ class TempDir {
 public:
     TempDir() = default;
 
-    /// Atomically create `$TMPDIR/<prefix>XXXXXX` (mkdtemp). Failure yields an
-    /// empty owner (operator bool is false); errno_string() describes why.
-    [[nodiscard]] static TempDir create(std::string_view prefix) {
-        std::string tmpl = (temp_directory() / std::string(prefix)).string();
+    /// Atomically create `<parent>/<prefix>XXXXXX` (mkdtemp), creating missing
+    /// parents first. Failure yields an empty owner (operator bool is false);
+    /// errno_string() describes why.
+    [[nodiscard]] static TempDir create(const fs::path& parent, std::string_view prefix) {
+        std::error_code ec;
+        fs::create_directories(parent, ec);
+        if (ec) {
+            errno = ec.value();
+            return {};
+        }
+        std::string tmpl = (parent / std::string(prefix)).string();
         tmpl += "XXXXXX";
         if (!::mkdtemp(tmpl.data())) return {};
         return TempDir(fs::path(std::move(tmpl)));
@@ -820,7 +827,8 @@ private:
 };
 
 struct StageOptions {
-    bool keep_temps = false;  ///< leave the stage temp directory in place on destruction
+    bool keep_temps = false;              ///< leave the stage temp directory in place on destruction
+    std::optional<fs::path> temp_dir;     ///< parent for the stage temp directory; default $TMPDIR or /tmp
 };
 
 /// Ordered asynchronous commands and checks; skip later operations after failure.
@@ -1146,7 +1154,7 @@ private:
             for (char c : name_.empty() ? std::string("stage") : name_)
                 prefix += (std::isalnum(static_cast<unsigned char>(c)) ? c : '_');
             prefix += '_' + std::to_string(::getpid()) + '_' + uuid4() + '_';
-            temp_dir_ = detail::TempDir::create(prefix);
+            temp_dir_ = detail::TempDir::create(options_.temp_dir ? *options_.temp_dir : detail::temp_directory(), prefix);
             if (!*temp_dir_) {
                 temp_dir_.reset();
                 fail("cannot create temp dir: " + detail::errno_string());
@@ -1264,6 +1272,14 @@ public:
     explicit StageTemplate(std::string name, StageOptions options = {})
         : name_(std::move(name)), options_(options) {}
 
+private:
+    template <class> using path_arg = const fs::path&;
+    template <class F, std::size_t... I>
+    static int invoke_paths(F& f, const std::vector<fs::path>& p, std::index_sequence<I...>) {
+        return std::invoke(f, p[I]...);
+    }
+
+public:
     StageTemplate& expect_which(std::string tool) & {
         Step& s = add(Step::which);
         s.text = std::move(tool);
@@ -1311,6 +1327,29 @@ public:
     }
     StageTemplate&& proc_to(TArg stdout_target, std::initializer_list<TArg> args, RunOptions opts = {}) && {
         return std::move(proc_to(std::move(stdout_target), args, std::move(opts)));
+    }
+
+    /// Record a function step. Each placeholder argument reaches `fn` as a
+    /// resolved `const fs::path&` at launch; other state is captured by `fn`,
+    /// which must be copyable. Lists and optional groups are not call arguments.
+    template <class F, class... Ts>
+        requires (std::is_constructible_v<TArg, Ts> && ...) &&
+                 std::is_invocable_r_v<int, F&, path_arg<Ts>...> &&
+                 std::is_copy_constructible_v<std::decay_t<F>>
+    StageTemplate& call(F&& fn, Ts&&... args) & {
+        Step& s = add(Step::function);
+        (s.args.push_back(TArg(std::forward<Ts>(args))), ...);
+        s.fn = [f = std::decay_t<F>(std::forward<F>(fn))](const std::vector<fs::path>& paths) mutable {
+            return invoke_paths(f, paths, std::index_sequence_for<Ts...>{});
+        };
+        return *this;
+    }
+    template <class F, class... Ts>
+        requires (std::is_constructible_v<TArg, Ts> && ...) &&
+                 std::is_invocable_r_v<int, F&, path_arg<Ts>...> &&
+                 std::is_copy_constructible_v<std::decay_t<F>>
+    StageTemplate&& call(F&& fn, Ts&&... args) && {
+        return std::move(call(std::forward<F>(fn), std::forward<Ts>(args)...));
     }
 
     /// Replay the recording with slots bound. Binding errors (an unbound
@@ -1377,6 +1416,28 @@ public:
                     out.proc_args(argv.data(), argv.data() + argv.size(), opts);
                     break;
                 }
+                case Step::function: {
+                    std::vector<fs::path> paths;
+                    paths.reserve(s.args.size());
+                    bool resolved = true;
+                    for (const auto& a : s.args) {
+                        auto v = lower(a, bound);
+                        if (!v) {
+                            out.fail("call() arguments must be paths, slots, or temp files");
+                            resolved = false;
+                            break;
+                        }
+                        if (const auto* tok = std::get_if<temp_file>(&*v)) {
+                            const fs::path* p = out.resolve(*tok);
+                            if (!p) { resolved = false; break; }
+                            paths.push_back(*p);
+                        } else {
+                            paths.emplace_back(std::get<std::string>(*v));
+                        }
+                    }
+                    if (resolved) out.call(s.fn, paths);
+                    break;
+                }
             }
         }
         return out;
@@ -1384,12 +1445,13 @@ public:
 
 private:
     struct Step {
-        enum Kind { which, file, file_pred, command } kind;
+        enum Kind { which, file, file_pred, command, function } kind;
         std::vector<TArg> args;
         std::string text;  ///< tool name, or predicate label
         RunOptions opts;
         std::function<bool(const fs::path&)> pred;
         std::optional<TArg> stdout_target;
+        std::function<int(const std::vector<fs::path>&)> fn;  ///< call() step body
     };
 
     Step& add(Step::Kind kind) {
