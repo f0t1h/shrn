@@ -180,6 +180,47 @@ It does not clean up sibling stages; `std::exit` does not destroy local objects.
 but does not clear the failed state. `with_error` and `with_stderr` replace the
 stored text; they do not mark the stage as failed.
 
+### Stage temp files
+
+`temp_file{"name"}` names a file in a private directory owned by the stage.
+Use it anywhere an argument or path goes; the same name always resolves to the
+same file within one stage, so one command's output is the next one's input:
+
+```cpp
+#include <shrn.hpp>
+
+int main() {
+    shrn::stage("map reads")
+        .expect_which("minimap2")
+        .expect_which("samtools")
+        .expect_file("reads.fq", shrn::file_non_empty, "non-empty")
+        .proc({"minimap2", "-a", "ref.fa", "reads.fq", "-o", shrn::temp_file{"aln.sam"}})
+        .expect_file(shrn::temp_file{"aln.sam"}, shrn::file_non_empty, "non-empty")
+        .proc({"samtools", "sort", "-o", shrn::temp_file{"aln.bam"}, shrn::temp_file{"aln.sam"}})
+        .proc({"samtools", "index", shrn::temp_file{"aln.bam"}})
+        .expect_file(shrn::temp_file{"aln.bam.bai"})
+        .proc({"cp", shrn::temp_file{"aln.bam"}, "final.bam"})
+        .or_die_if(true);
+}
+```
+
+The directory is created on first use under `$TMPDIR` (or `/tmp`) as
+`shrn_<stage>_<pid>_<uuid>_XXXXXX`, so concurrent runs and same-named stages
+never collide. It is removed when the stage is destroyed. Files inside keep
+the names you gave them, so tools that inspect extensions or write sidecar
+files (`aln.bam.bai` beside `aln.bam`) behave normally. Names are single path
+components; separators and `..` fail the stage.
+
+`call(fn, shrn::temp_file{"x"})` passes the resolved path as
+`const std::filesystem::path&`. `temp_path("x")` returns it directly, for
+example to hand a result to a later stage; a stage joined with `after` outlives
+the reference. Tokens are stage-local and never resolve across stages.
+
+Pass `{.keep_temps = true}` to keep the directory:
+`shrn::stage("map reads", {.keep_temps = true})`. On a fatal `or_die_if(true)`
+the process exits without running destructors; the directory survives and its
+path is printed with the error so the artifacts can be inspected.
+
 ## Files
 
 - `file_readable` and `file_non_empty` return booleans.

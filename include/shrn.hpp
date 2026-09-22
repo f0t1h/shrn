@@ -4,6 +4,7 @@
 #ifndef SHRN_HPP
 #define SHRN_HPP
 
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
@@ -12,12 +13,17 @@
 #include <cstring>
 #include <filesystem>
 #include <functional>
+#include <initializer_list>
+#include <memory>
 #include <optional>
 #include <string>
-#include <type_traits>
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <type_traits>
+#include <unordered_map>
+#include <variant>
+#include <vector>
 
 #include <fcntl.h>
 #include <poll.h>
@@ -139,6 +145,45 @@ struct unique_fd {
 
 [[nodiscard]] inline fs::path make_temp_dir(std::string_view prefix = "shrn_") {
     return make_temp_dir_in(temp_directory(), prefix);
+}
+
+/// Random RFC 4122 version-4 UUID text; falls back to clock and pid entropy
+/// if /dev/urandom is unavailable. Never throws.
+[[nodiscard]] inline std::string uuid4() {
+    unsigned char bytes[16];
+    bool filled = false;
+    if (int fd = ::open("/dev/urandom", O_RDONLY | O_CLOEXEC); fd != -1) {
+        std::size_t have = 0;
+        while (have < sizeof bytes) {
+            ssize_t n = ::read(fd, bytes + have, sizeof bytes - have);
+            if (n <= 0) {
+                if (n == -1 && errno == EINTR) continue;
+                break;
+            }
+            have += static_cast<std::size_t>(n);
+        }
+        ::close(fd);
+        filled = have == sizeof bytes;
+    }
+    if (!filled) {
+        auto seed = static_cast<unsigned long long>(std::chrono::steady_clock::now().time_since_epoch().count()) ^
+                    (static_cast<unsigned long long>(::getpid()) << 32);
+        for (auto& b : bytes) {
+            seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;  // xorshift64
+            b = static_cast<unsigned char>(seed);
+        }
+    }
+    bytes[6] = static_cast<unsigned char>((bytes[6] & 0x0f) | 0x40);  // version 4
+    bytes[8] = static_cast<unsigned char>((bytes[8] & 0x3f) | 0x80);  // variant 1
+    static constexpr char hex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(36);
+    for (int i = 0; i < 16; ++i) {
+        if (i == 4 || i == 6 || i == 8 || i == 10) out += '-';
+        out += hex[bytes[i] >> 4];
+        out += hex[bytes[i] & 0x0f];
+    }
+    return out;
 }
 
 /// Owns a temp file; removed on destruction unless released.
@@ -826,16 +871,51 @@ inline Process spawn(const std::vector<std::string>& args, const RunOptions& opt
 
 // Outcome: ordered checks and commands
 
+/// Names a file inside the owning stage's private temp directory. The same
+/// name always resolves to the same path within one stage; the directory is
+/// created on first use and removed with the stage unless keep_temps is set.
+struct temp_file {
+    std::string name;  ///< single path component, e.g. "aln.bam"; sidecars like "aln.bam.bai" live beside it
+};
+
+/// One argv element for proc(): plain text or a stage temp token.
+class Arg {
+public:
+    Arg(const char* text) : value_(std::string(text)) {}
+    Arg(std::string text) : value_(std::move(text)) {}
+    Arg(const fs::path& path) : value_(path.string()) {}
+    Arg(temp_file token) : value_(std::move(token)) {}
+
+private:
+    friend class Outcome;
+    std::variant<std::string, temp_file> value_;
+};
+
+struct StageOptions {
+    bool keep_temps = false;  ///< leave the stage temp directory in place on destruction
+};
 
 /// Ordered asynchronous commands and checks; skip later operations after failure.
 class Outcome {
 public:
     Outcome() = default;
-    explicit Outcome(std::string name) noexcept : name_(std::move(name)) {}
+    explicit Outcome(std::string name, StageOptions options = {}) noexcept
+        : name_(std::move(name)), options_(options) {}
     Outcome(const Outcome&) = delete;
     Outcome& operator=(const Outcome&) = delete;
     Outcome(Outcome&&) noexcept = default;
     Outcome& operator=(Outcome&&) noexcept = default;
+
+    ~Outcome() {
+        if (options_.keep_temps && temp_dir_) (void) temp_dir_->release();
+    }
+
+private:
+    /// What a call() argument becomes at the callee: temp tokens turn into paths.
+    template <class T>
+    using resolved_t = std::conditional_t<std::is_same_v<std::remove_cvref_t<T>, temp_file>, const fs::path&, T>;
+
+public:
 
     /// Wait for the previous command, then start args without waiting for completion.
     Outcome& proc(const std::vector<std::string>& args, const RunOptions& opts = {}) & {
@@ -850,20 +930,51 @@ public:
         return std::move(proc(args, opts));
     }
 
+    /// Braced argument lists may mix text with temp_file tokens.
+    Outcome& proc(std::initializer_list<Arg> args, const RunOptions& opts = {}) & {
+        if (!ok()) return *this;
+        std::vector<std::string> resolved;
+        resolved.reserve(args.size());
+        for (const Arg& a : args) {
+            if (const auto* token = std::get_if<temp_file>(&a.value_)) {
+                const fs::path* p = resolve(*token);
+                if (!p) return *this;  // resolve() recorded the failure
+                resolved.push_back(p->string());
+            } else {
+                resolved.push_back(std::get<std::string>(a.value_));
+            }
+        }
+        return proc(resolved, opts);
+    }
+    Outcome&& proc(std::initializer_list<Arg> args, const RunOptions& opts = {}) && {
+        return std::move(proc(args, opts));
+    }
+
     /// Wait for the previous command, then invoke on the caller's thread.
+    /// temp_file arguments are resolved to `const fs::path&` before the call.
     template <class F, class... Args>
-        requires std::is_invocable_r_v<int, F, Args...>
+        requires std::is_invocable_r_v<int, F, resolved_t<Args>...>
     Outcome& call(F&& fn, Args&&... args) & {
         if (!ok()) return *this;
         cmd_.clear();
-        int status = std::invoke(std::forward<F>(fn), std::forward<Args>(args)...);
+        bool resolvable = (resolve_arg(args) && ...);
+        if (!resolvable) return *this;  // resolve_arg() recorded the failure
+        int status = std::invoke(std::forward<F>(fn), forward_arg<Args>(args)...);
         if (status != 0) fail("function returned code " + std::to_string(status));
         return *this;
     }
     template <class F, class... Args>
-        requires std::is_invocable_r_v<int, F, Args...>
+        requires std::is_invocable_r_v<int, F, resolved_t<Args>...>
     Outcome&& call(F&& fn, Args&&... args) && {
         return std::move(call(std::forward<F>(fn), std::forward<Args>(args)...));
+    }
+
+    /// The resolved path for a temp name; creates the stage temp directory on
+    /// first use. Empty (and the stage failed) if the directory cannot be made.
+    [[nodiscard]] const fs::path& temp_path(std::string_view name) {
+        static const fs::path none;
+        const fs::path* p = resolve(temp_file{std::string(name)});
+        return p ? *p : none;
     }
 
     /// Join all prerequisites, preserving the first failure in argument order.
@@ -980,6 +1091,11 @@ public:
     Outcome&& expect_file(const fs::path& p) && {
         return std::move(expect_file(p));
     }
+    Outcome& expect_file(temp_file token) & {
+        if (const fs::path* p = ok() ? resolve(token) : nullptr) expect_file(*p);
+        return *this;
+    }
+    Outcome&& expect_file(temp_file token) && { return std::move(expect_file(std::move(token))); }
 
     template <class Pred>
         requires std::is_invocable_r_v<bool, Pred, const fs::path&>
@@ -993,6 +1109,17 @@ public:
         requires std::is_invocable_r_v<bool, Pred, const fs::path&>
     Outcome&& expect_file(const fs::path& p, Pred&& pred, std::string_view what) && {
         return std::move(expect_file(p, std::forward<Pred>(pred), what));
+    }
+    template <class Pred>
+        requires std::is_invocable_r_v<bool, Pred, const fs::path&>
+    Outcome& expect_file(temp_file token, Pred&& pred, std::string_view what) & {
+        if (const fs::path* p = ok() ? resolve(token) : nullptr) expect_file(*p, std::forward<Pred>(pred), what);
+        return *this;
+    }
+    template <class Pred>
+        requires std::is_invocable_r_v<bool, Pred, const fs::path&>
+    Outcome&& expect_file(temp_file token, Pred&& pred, std::string_view what) && {
+        return std::move(expect_file(std::move(token), std::forward<Pred>(pred), what));
     }
 
     template <class F>
@@ -1015,6 +1142,7 @@ public:
             if (!detail_.empty()) std::fprintf(stderr, " (%s)", detail_.c_str());
             std::fprintf(stderr, "\n");
             if (!stderr_.empty()) std::fprintf(stderr, "[ERROR] stderr:\n%s\n", stderr_.c_str());
+            if (temp_dir_) std::fprintf(stderr, "[ERROR] temp files kept in %s\n", temp_dir_->path().c_str());
             std::fflush(stderr);
             std::exit(EXIT_FAILURE);
         }
@@ -1068,18 +1196,58 @@ private:
         finish();
     }
 
+    // --- stage temp files -------------------------------------------------
+
+    /// Resolve a token to its path inside the stage temp directory, creating the
+    /// directory on first use. Records a stage failure and returns null on error.
+    const fs::path* resolve(const temp_file& token) {
+        const std::string& n = token.name;
+        if (n.empty() || n == "." || n == ".." || n.find('/') != std::string::npos) {
+            fail("invalid temp file name: '" + n + "'");
+            return nullptr;
+        }
+        if (!temp_dir_) {
+            std::string prefix = "shrn_";
+            for (char c : name_.empty() ? std::string("stage") : name_)
+                prefix += (std::isalnum(static_cast<unsigned char>(c)) ? c : '_');
+            prefix += '_' + std::to_string(::getpid()) + '_' + uuid4() + '_';
+            temp_dir_ = TempDir::create(prefix);
+            if (!*temp_dir_) {
+                temp_dir_.reset();
+                fail("cannot create temp dir: " + detail::errno_string());
+                return nullptr;
+            }
+        }
+        auto [it, inserted] = temp_paths_.try_emplace(n, temp_dir_->path() / n);
+        return &it->second;
+    }
+
+    /// call() support: non-token arguments always resolve; tokens must resolve.
+    template <class T>
+    bool resolve_arg(T& arg) {
+        if constexpr (std::is_same_v<std::remove_cvref_t<T>, temp_file>) return resolve(arg) != nullptr;
+        else return true;
+    }
+    template <class T, class U>
+    decltype(auto) forward_arg(U& arg) {
+        if constexpr (std::is_same_v<std::remove_cvref_t<T>, temp_file>) return static_cast<const fs::path&>(*resolve(arg));
+        else return std::forward<T>(arg);
+    }
 
     mutable int code_ = 0;
     std::string name_;
+    StageOptions options_;
     std::string cmd_;
     mutable std::string detail_;
     mutable std::string stderr_;
     mutable std::optional<Process> pending_;
+    std::optional<TempDir> temp_dir_;                    ///< created on first temp_file use
+    std::unordered_map<std::string, fs::path> temp_paths_;  ///< name -> resolved path
 };
 
 /// Start a named stage.
-[[nodiscard]] inline Outcome stage(std::string name) {
-    return Outcome(std::move(name));
+[[nodiscard]] inline Outcome stage(std::string name, StageOptions options = {}) {
+    return Outcome(std::move(name), options);
 }
 
 /// Anonymous single-command stage: proc(args, opts) == Outcome().proc(args, opts).

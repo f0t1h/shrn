@@ -946,6 +946,78 @@ static void test_outcome_async(const fs::path& dir) {
     CHECK(!fs::exists(fbase + ".late"), "the cleaned-up child never finished its work");
 }
 
+// Outcome: stage-scoped temp files
+static void test_outcome_temps() {
+    std::fprintf(stderr, "outcome temps\n");
+
+    // Tokens resolve inside one private directory; the same name is the same file,
+    // so a later command consumes an earlier command's output and sidecars sit beside it.
+    fs::path dir;
+    int measured = 0;
+    {
+        auto s = shrn::stage("map reads")
+                     .proc({"sh", "-c", "printf hello > \"$0\"", shrn::temp_file{"aln.sam"}})
+                     .expect_file(shrn::temp_file{"aln.sam"}, shrn::file_non_empty, "non-empty")
+                     .proc({"sh", "-c", "cp \"$0\" \"$1\" && touch \"$1.bai\"",
+                            shrn::temp_file{"aln.sam"}, shrn::temp_file{"aln.bam"}})
+                     .expect_file(shrn::temp_file{"aln.bam.bai"})
+                     .call([](const fs::path& p, int& out) {
+                         out = static_cast<int>(slurp(p).size());
+                         return 0;
+                     }, shrn::temp_file{"aln.bam"}, measured);
+        CHECK(s.ok(), "a stage chains commands through temp tokens");
+        CHECK(measured == 5, "call() receives a temp token as its resolved path");
+        dir = s.temp_path("aln.sam").parent_path();
+        CHECK(fs::is_directory(dir) && dir.filename().string().rfind("shrn_map_reads_", 0) == 0,
+              "the stage temp directory is named after the stage");
+        CHECK(s.temp_path("aln.sam") == dir / "aln.sam" && s.temp_path("aln.bam") == dir / "aln.bam",
+              "temp_path() exposes the resolved paths");
+    }
+    CHECK(!fs::exists(dir), "the stage destructor removes its temp directory");
+
+    // keep_temps leaves the directory in place.
+    fs::path kept;
+    {
+        auto k = shrn::stage("keep", {.keep_temps = true}).proc({"touch", shrn::temp_file{"x"}});
+        CHECK(k.ok(), "keep_temps stage runs");
+        kept = k.temp_path("x").parent_path();
+    }
+    CHECK(fs::exists(kept / "x"), "keep_temps preserves the directory and its files");
+    fs::remove_all(kept);
+
+    // Two stages with the same name never share a directory.
+    auto a = shrn::stage("dup");
+    auto b = shrn::stage("dup");
+    CHECK(a.temp_path("f").parent_path() != b.temp_path("f").parent_path(),
+          "same-named stages get distinct temp directories");
+
+    // Invalid names fail the stage without creating anything.
+    auto escape = shrn::stage("escape").proc({"true", shrn::temp_file{"../out"}});
+    CHECK(!escape.ok() && escape.detail().find("invalid temp file name") != std::string::npos,
+          "a temp name with a path separator is rejected");
+    CHECK(!shrn::stage("blank").expect_file(shrn::temp_file{""}).ok(), "an empty temp name is rejected");
+
+    // A moved stage carries its directory; the moved-from shell must not remove it.
+    fs::path moved_dir;
+    {
+        auto src = shrn::stage("mover").proc({"touch", shrn::temp_file{"m"}}).wait();
+        moved_dir = src.temp_path("m").parent_path();
+        shrn::Outcome dst = std::move(src);
+        CHECK(fs::exists(moved_dir / "m"), "moving a stage does not disturb its temp files");
+    }
+    CHECK(!fs::exists(moved_dir), "the moved-to stage owns and removes the temp directory");
+
+    // Plain arguments still forward untouched through call(); vector<string> proc is unaffected.
+    int side = 0;
+    CHECK(shrn::stage("plain").call([](int& v) { v = 7; return 0; }, side).ok() && side == 7,
+          "call() forwards non-token arguments as before");
+    std::vector<std::string> cmd = {"true"};
+    CHECK(shrn::proc(cmd).ok(), "the vector<string> proc overload still resolves");
+
+    auto u = shrn::uuid4();
+    CHECK(u.size() == 36 && u[14] == '4' && u != shrn::uuid4(), "uuid4() yields distinct version-4 text");
+}
+
 int main(int argc, char** argv) {
     init_self_exe(argv[0]);
     if (argc >= 2) {
@@ -969,6 +1041,7 @@ int main(int argc, char** argv) {
     test_process_spawn(root.path());
     test_outcome(root.path());
     test_outcome_async(root.path());
+    test_outcome_temps();
 
     std::fprintf(stderr, "%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
