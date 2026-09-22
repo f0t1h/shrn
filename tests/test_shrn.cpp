@@ -988,7 +988,7 @@ static void test_stage_templates(const fs::path& dir) {
     write_file(dir / "tpl_in1.txt", "one");
     write_file(dir / "tpl_in2.txt", "two");
 
-    // One recipe executed twice: each exec gets its own temps and produces its own output.
+    // One recipe launched twice: each launch gets its own temps and produces its own output.
     const auto copy = shrn::StageTemplate("copy")
                           .expect_which("cp")
                           .expect_file(shrn::slot{"src"}, shrn::file_non_empty, "non-empty")
@@ -997,69 +997,69 @@ static void test_stage_templates(const fs::path& dir) {
                           .expect_file(shrn::slot{"dst"});
     fs::path t1, t2;
     {
-        auto a = copy.exec({{"src", dir / "tpl_in1.txt"}, {"dst", dir / "tpl_out1.txt"}}).wait();
-        auto b = copy.exec({{"src", dir / "tpl_in2.txt"}, {"dst", dir / "tpl_out2.txt"}}).wait();
+        auto a = copy.launch({{"src", dir / "tpl_in1.txt"}, {"dst", dir / "tpl_out1.txt"}}).wait();
+        auto b = copy.launch({{"src", dir / "tpl_in2.txt"}, {"dst", dir / "tpl_out2.txt"}}).wait();
         CHECK(a.ok() && b.ok(), "a template executes as working stages");
         t1 = a.temp_path("scratch").parent_path();
         t2 = b.temp_path("scratch").parent_path();
-        CHECK(t1 != t2, "each exec owns a separate temp directory");
+        CHECK(t1 != t2, "each launch owns a separate temp directory");
     }
     CHECK(slurp(dir / "tpl_out1.txt") == "one" && slurp(dir / "tpl_out2.txt") == "two",
-          "slots substitute per exec");
+          "slots substitute per launch");
     CHECK(!fs::exists(t1) && !fs::exists(t2), "executed stages clean up their temps");
 
     // Binding errors are detected before anything runs.
-    auto unbound = copy.exec({{"src", dir / "tpl_in1.txt"}});
-    CHECK(!unbound.ok() && unbound.detail() == "unbound slot: 'dst'", "an unbound required slot fails exec");
-    auto typo = copy.exec({{"src", dir / "tpl_in1.txt"}, {"dts", dir / "tpl_never"}});
-    CHECK(!typo.ok() && typo.detail() == "unknown binding: 'dts'", "a binding no slot uses fails exec");
-    CHECK(!fs::exists(dir / "tpl_never"), "a failed exec runs no command");
+    auto unbound = copy.launch({{"src", dir / "tpl_in1.txt"}});
+    CHECK(!unbound.ok() && unbound.detail() == "unbound slot: 'dst'", "an unbound required slot fails launch");
+    auto typo = copy.launch({{"src", dir / "tpl_in1.txt"}, {"dts", dir / "tpl_never"}});
+    CHECK(!typo.ok() && typo.detail() == "unknown binding: 'dts'", "a binding no slot uses fails launch");
+    CHECK(!fs::exists(dir / "tpl_never"), "a failed launch runs no command");
 
     // Defaults satisfy an unbound slot and yield to an explicit binding.
     const auto dflt = shrn::StageTemplate("default")
                           .proc({"sh", "-c", "printf \"$0\" > \"$1\"", shrn::slot{"text", "fallback"}, shrn::slot{"out"}});
-    CHECK(dflt.exec({{"out", dir / "tpl_d1"}}).wait().ok() && slurp(dir / "tpl_d1") == "fallback",
+    CHECK(dflt.launch({{"out", dir / "tpl_d1"}}).wait().ok() && slurp(dir / "tpl_d1") == "fallback",
           "an unbound slot uses its default");
-    CHECK(dflt.exec({{"out", dir / "tpl_d2"}, {"text", "given"}}).wait().ok() && slurp(dir / "tpl_d2") == "given",
+    CHECK(dflt.launch({{"out", dir / "tpl_d2"}, {"text", "given"}}).wait().ok() && slurp(dir / "tpl_d2") == "given",
           "a binding overrides the default");
 
     // Optional groups are atomic: present only when every slot inside is bound.
     const auto opt = shrn::StageTemplate("optional")
                          .proc({"sh", "-c", "printf \"%s\" \"$@\" > \"$0\"", shrn::slot{"out"},
                                 "-1", shrn::slot{"r1"}, shrn::optional{"-2", shrn::slot{"r2"}}});
-    CHECK(opt.exec({{"out", dir / "tpl_o1"}, {"r1", "A"}}).wait().ok() && slurp(dir / "tpl_o1") == "-1A",
+    CHECK(opt.launch({{"out", dir / "tpl_o1"}, {"r1", "A"}}).wait().ok() && slurp(dir / "tpl_o1") == "-1A",
           "an optional group with an unbound slot is dropped whole");
-    CHECK(opt.exec({{"out", dir / "tpl_o2"}, {"r1", "A"}, {"r2", "B"}}).wait().ok() && slurp(dir / "tpl_o2") == "-1A-2B",
+    CHECK(opt.launch({{"out", dir / "tpl_o2"}, {"r1", "A"}, {"r2", "B"}}).wait().ok() && slurp(dir / "tpl_o2") == "-1A-2B",
           "an optional group with all slots bound is included whole");
     const auto mixed = shrn::StageTemplate("mixed").proc({"true", shrn::slot{"x"}, shrn::optional{"-x", shrn::slot{"x"}}});
-    CHECK(!mixed.exec({}).ok(), "a slot also used outside a group stays required");
+    CHECK(!mixed.launch({}).ok(), "a slot also used outside a group stays required");
 
-    // The caller decides at exec whether an output is scratch or a deliverable.
+    // The caller decides at launch whether an output is scratch or a deliverable.
     const auto emit = shrn::StageTemplate("emit").proc({"sh", "-c", "printf hi > \"$0\"", shrn::slot{"out"}});
     {
-        auto scratch = emit.exec({{"out", shrn::temp_file{"s.txt"}}}).wait();
+        auto scratch = emit.launch({{"out", shrn::temp_file{"s.txt"}}}).wait();
         CHECK(scratch.ok() && slurp(scratch.temp_path("s.txt")) == "hi", "a slot bound to a temp token writes into the stage temps");
     }
-    CHECK(emit.exec({{"out", dir / "tpl_deliver.txt"}}).wait().ok() && slurp(dir / "tpl_deliver.txt") == "hi",
+    CHECK(emit.launch({{"out", dir / "tpl_deliver.txt"}}).wait().ok() && slurp(dir / "tpl_deliver.txt") == "hi",
           "the same slot bound to a path writes a deliverable");
 
     // proc_to redirects stdout into a slot or a temp token.
     const auto redirect = shrn::StageTemplate("redirect")
                               .proc_to(shrn::slot{"log"}, {"sh", "-c", "echo captured"})
                               .expect_file(shrn::slot{"log"}, shrn::file_non_empty, "non-empty");
-    CHECK(redirect.exec({{"log", dir / "tpl_log.txt"}}).wait().ok() && slurp(dir / "tpl_log.txt") == "captured\n",
+    CHECK(redirect.launch({{"log", dir / "tpl_log.txt"}}).wait().ok() && slurp(dir / "tpl_log.txt") == "captured\n",
           "proc_to binds stdout to a slot");
     const auto redirect_tmp = shrn::StageTemplate("redirect tmp")
                                   .proc_to(shrn::temp_file{"o"}, {"echo", "x"})
                                   .expect_file(shrn::temp_file{"o"});
-    CHECK(redirect_tmp.exec({}).wait().ok(), "proc_to binds stdout to a temp token");
+    CHECK(redirect_tmp.launch({}).wait().ok(), "proc_to binds stdout to a temp token");
 
     fs::path kept;
     {
-        auto k = shrn::StageTemplate("keep", {.keep_temps = true}).proc({"touch", shrn::temp_file{"k"}}).exec({}).wait();
+        auto k = shrn::StageTemplate("keep", {.keep_temps = true}).proc({"touch", shrn::temp_file{"k"}}).launch({}).wait();
         kept = k.temp_path("k").parent_path();
     }
-    CHECK(fs::exists(kept / "k"), "keep_temps carries through exec");
+    CHECK(fs::exists(kept / "k"), "keep_temps carries through launch");
     fs::remove_all(kept);
 
     // many{} binds a list that expands in place; expect_file over it checks every element.
@@ -1074,37 +1074,37 @@ static void test_stage_templates(const fs::path& dir) {
                                .proc({"sh", "-c", "printf \"%s|\" \"$@\" > \"$0\"", shrn::slot{"out"},
                                       shrn::slot{"query"}, shrn::many{"plasmids"}, "-t", shrn::slot{"threads", "4"}})
                                .expect_file(shrn::slot{"out"});
-    CHECK(propagate.exec({{"query", dir / "tpl_q"}, {"plasmids", plasmids}, {"out", dir / "tpl_m1"}}).wait().ok() &&
+    CHECK(propagate.launch({{"query", dir / "tpl_q"}, {"plasmids", plasmids}, {"out", dir / "tpl_m1"}}).wait().ok() &&
               slurp(dir / "tpl_m1") == (dir / "tpl_q").string() + "|" + (dir / "tpl_p1").string() + "|" +
                                           (dir / "tpl_p2").string() + "|-t|4|",
           "a list expands in place between scalar slots");
-    CHECK(propagate.exec({{"query", dir / "tpl_q"}, {"plasmids", std::vector<fs::path>{}}, {"out", dir / "tpl_m2"}}).wait().ok() &&
+    CHECK(propagate.launch({{"query", dir / "tpl_q"}, {"plasmids", std::vector<fs::path>{}}, {"out", dir / "tpl_m2"}}).wait().ok() &&
               slurp(dir / "tpl_m2") == (dir / "tpl_q").string() + "|-t|4|",
           "a bound empty list expands to nothing");
-    auto element = propagate.exec({{"query", dir / "tpl_q"}, {"plasmids", std::vector<fs::path>{dir / "tpl_p1", dir / "tpl_blank"}},
+    auto element = propagate.launch({{"query", dir / "tpl_q"}, {"plasmids", std::vector<fs::path>{dir / "tpl_p1", dir / "tpl_blank"}},
                                    {"out", dir / "tpl_m3"}}).wait();
     CHECK(!element.ok() && element.detail() == "not non-empty: " + (dir / "tpl_blank").string(),
           "a per-element check names the failing element");
     CHECK(!fs::exists(dir / "tpl_m3"), "a failed element check runs no command");
-    auto unbound_list = propagate.exec({{"query", dir / "tpl_q"}, {"out", dir / "tpl_m4"}});
+    auto unbound_list = propagate.launch({{"query", dir / "tpl_q"}, {"out", dir / "tpl_m4"}});
     CHECK(!unbound_list.ok() && unbound_list.detail() == "unbound slot: 'plasmids'", "an unbound list is required");
-    auto scalar_to_list = propagate.exec({{"query", dir / "tpl_q"}, {"plasmids", "one"}, {"out", dir / "tpl_m5"}});
+    auto scalar_to_list = propagate.launch({{"query", dir / "tpl_q"}, {"plasmids", "one"}, {"out", dir / "tpl_m5"}});
     CHECK(!scalar_to_list.ok() && scalar_to_list.detail() == "scalar bound to list slot: 'plasmids'",
-          "binding a scalar to many{} fails exec");
-    auto list_to_scalar = propagate.exec({{"query", plasmids}, {"plasmids", plasmids}, {"out", dir / "tpl_m6"}});
+          "binding a scalar to many{} fails launch");
+    auto list_to_scalar = propagate.launch({{"query", plasmids}, {"plasmids", plasmids}, {"out", dir / "tpl_m6"}});
     CHECK(!list_to_scalar.ok() && list_to_scalar.detail() == "list bound to slot: 'query'",
-          "binding a list to slot{} fails exec");
+          "binding a list to slot{} fails launch");
 
     // many{} inside an optional group: dropped when unbound, present when bound even if empty.
     const auto extras = shrn::StageTemplate("extras")
                             .proc({"sh", "-c", "printf \"%s|\" \"$@\" > \"$0\"", shrn::slot{"out"}, "x",
                                    shrn::optional{"--extra", shrn::many{"more"}}});
-    CHECK(extras.exec({{"out", dir / "tpl_x1"}}).wait().ok() && slurp(dir / "tpl_x1") == "x|",
+    CHECK(extras.launch({{"out", dir / "tpl_x1"}}).wait().ok() && slurp(dir / "tpl_x1") == "x|",
           "an optional group with an unbound list is dropped");
-    CHECK(extras.exec({{"out", dir / "tpl_x2"}, {"more", std::vector<fs::path>{dir / "tpl_p1"}}}).wait().ok() &&
+    CHECK(extras.launch({{"out", dir / "tpl_x2"}, {"more", std::vector<fs::path>{dir / "tpl_p1"}}}).wait().ok() &&
               slurp(dir / "tpl_x2") == "x|--extra|" + (dir / "tpl_p1").string() + "|",
           "an optional group with a bound list is included");
-    CHECK(extras.exec({{"out", dir / "tpl_x3"}, {"more", std::vector<fs::path>{}}}).wait().ok() &&
+    CHECK(extras.launch({{"out", dir / "tpl_x3"}, {"more", std::vector<fs::path>{}}}).wait().ok() &&
               slurp(dir / "tpl_x3") == "x|--extra|",
           "a bound empty list keeps its optional group");
 }

@@ -1092,7 +1092,7 @@ public:
     }
 
 private:
-    friend class StageTemplate;  ///< exec() starts a stage failed on binding errors
+    friend class StageTemplate;  ///< launch() starts a stage failed on binding errors
 
     void fail(std::string detail) const {
         if (code_ != 0) return;
@@ -1194,7 +1194,7 @@ private:
 
 // StageTemplate: a recorded stage with path placeholders
 
-/// A placeholder in a template, bound to a path at exec. A slot with
+/// A placeholder in a template, bound to a path at launch. A slot with
 /// a default is satisfied by the default when left unbound; one without is
 /// required unless it appears only inside optional groups.
 struct slot {
@@ -1204,7 +1204,7 @@ struct slot {
     slot(std::string n, std::string d) : name(std::move(n)), default_value(std::move(d)) {}
 };
 
-/// A list placeholder, bound to a vector of paths at exec. It expands in
+/// A list placeholder, bound to a vector of paths at launch. It expands in
 /// place in argv and, in expect_file, checks every element. Required unless
 /// it appears only inside optional groups; a bound empty list is valid.
 struct many {
@@ -1240,7 +1240,7 @@ private:
 inline optional::optional(std::initializer_list<TArg> a) : args(a) {}
 
 /// A binding target: a concrete path, a temp token so the caller decides at
-/// exec whether an output is scratch or a deliverable, or a list for `many`.
+/// launch whether an output is scratch or a deliverable, or a list for `many`.
 struct binding {
     using list = std::vector<std::string>;
     std::string name;
@@ -1257,8 +1257,8 @@ struct binding {
     binding(std::string n, list items) : name(std::move(n)), value(std::move(items)) {}
 };
 
-/// Records checks and commands once; exec() replays them into a fresh
-/// Outcome with slots substituted. Each exec owns its own temp files.
+/// Records checks and commands once; launch() replays them into a fresh
+/// Outcome with slots substituted. Each launch owns its own temp files.
 class StageTemplate {
 public:
     explicit StageTemplate(std::string name, StageOptions options = {})
@@ -1316,7 +1316,7 @@ public:
     /// Replay the recording with slots bound. Binding errors (an unbound
     /// required slot, a name no slot uses, or a list bound to a scalar slot and
     /// vice versa) start the stage failed; nothing runs.
-    [[nodiscard]] Outcome exec(std::initializer_list<binding> bindings) const {
+    [[nodiscard]] Outcome launch(std::initializer_list<binding> bindings) const {
         Outcome out(name_, options_);
         Bound bound;
         for (const auto& b : bindings) bound.emplace(b.name, b.value);

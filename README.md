@@ -47,7 +47,7 @@ that is the callback throwing, not shrn. The header also builds with
 
 ## Processes
 
-`spawn(args, options)` starts a child and returns `Process` after exec
+`spawn(args, options)` starts a child and returns `Process` after launch
 succeeds. `run(args, options)` is the synchronous version: spawn, then wait.
 Both use `fork` and `execvp`, search PATH, and inherit the
 environment. Pass each argument as a separate string. The argument list is not
@@ -57,7 +57,7 @@ for display, not execution.
 
 | `RunOptions` field | Behavior |
 |---|---|
-| `workdir` | Change the child's directory before exec. |
+| `workdir` | Change the child's directory before launch. |
 | `capture_stderr` | Capture stderr using one reader thread; default `true`. |
 | `inherit_stdout` | Default `true`; `false` sends stdout to `/dev/null`. |
 | `stdout_file` | Create or truncate this file; overrides `inherit_stdout`. Relative paths use the caller's directory, not `workdir`. |
@@ -86,7 +86,7 @@ previously owned child. Do not call methods concurrently on the same handle.
 Only stderr capture needs a reader thread; `stdout_file` is ordinary file
 redirection. Waiting collects buffered stderr without waiting for descendants
 to close inherited writers; later descendant output is not captured. Termination
-does not kill a process group. Internal descriptors are closed across exec.
+does not kill a process group. Internal descriptors are closed across launch.
 Spawn hooks run on the launching thread.
 
 ## Stages
@@ -223,9 +223,9 @@ path is printed with the error so the artifacts can be inspected.
 ### Stage templates
 
 A `StageTemplate` records a stage's checks and commands once, with `slot`
-placeholders where paths vary. `exec()` binds the slots and returns an
+placeholders where paths vary. `launch()` binds the slots and returns an
 ordinary `Outcome`, so deadlines, joins, and temp files all work on the result.
-Each `exec()` gets its own temp directory.
+Each `launch()` gets its own temp directory.
 
 ```cpp
 #include <shrn.hpp>
@@ -239,9 +239,9 @@ int main() {
                shrn::slot{"ref"}, shrn::slot{"reads"}, "-o", shrn::slot{"out"}})
         .expect_file(shrn::slot{"out"}, shrn::file_non_empty, "non-empty");
 
-    align.exec({{"ref", "ref.fa"}, {"reads", "a.fq"}, {"out", "a.sam"}})
+    align.launch({{"ref", "ref.fa"}, {"reads", "a.fq"}, {"out", "a.sam"}})
         .or_die_if(true);
-    align.exec({{"ref", "ref.fa"}, {"reads", "b.fq"}, {"out", "b.sam"},
+    align.launch({{"ref", "ref.fa"}, {"reads", "b.fq"}, {"out", "b.sam"},
                        {"preset", "map-ont"}, {"threads", "16"}})
         .or_die_if(true);
 }
@@ -263,16 +263,16 @@ int main() {
         .proc({"minimap2", "-a", shrn::slot{"ref"}, shrn::many{"reads"}, "-o", shrn::slot{"out"}});
 
     std::vector<std::filesystem::path> reads = {"a.fq", "b.fq", "c.fq"};
-    align_all.exec({{"ref", "ref.fa"}, {"reads", reads}, {"out", "all.sam"}}).or_die_if(true);
+    align_all.launch({{"ref", "ref.fa"}, {"reads", reads}, {"out", "all.sam"}}).or_die_if(true);
 }
 ```
 
-Binding mistakes fail at `exec()`, before any command runs: an unbound
+Binding mistakes fail at `launch()`, before any command runs: an unbound
 required placeholder reports `unbound slot: 'name'`, a binding that no
 placeholder uses reports `unknown binding: 'name'`, and binding a list to a
 `slot` or a scalar to a `many` reports the mismatch. A slot may be bound to a
-`temp_file` token, letting the caller decide per `exec()` whether an output is
-scratch or a deliverable; temp tokens inside a template resolve when `exec()`
+`temp_file` token, letting the caller decide per `launch()` whether an output is
+scratch or a deliverable; temp tokens inside a template resolve when `launch()`
 runs, so each execution owns its own temp directory. `proc_to(target, {...})`
 redirects a command's stdout to a slot or temp token. Predicates are stored
 type-erased; `RunOptions` other than the stdout target are fixed when the
