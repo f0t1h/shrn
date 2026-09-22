@@ -223,9 +223,9 @@ path is printed with the error so the artifacts can be inspected.
 ### Stage templates
 
 A `StageTemplate` records a stage's checks and commands once, with `slot`
-placeholders where paths vary. `instantiate()` binds the slots and returns an
+placeholders where paths vary. `exec()` binds the slots and returns an
 ordinary `Outcome`, so deadlines, joins, and temp files all work on the result.
-Each instantiation gets its own temp directory.
+Each `exec()` gets its own temp directory.
 
 ```cpp
 #include <shrn.hpp>
@@ -239,9 +239,9 @@ int main() {
                shrn::slot{"ref"}, shrn::slot{"reads"}, "-o", shrn::slot{"out"}})
         .expect_file(shrn::slot{"out"}, shrn::file_non_empty, "non-empty");
 
-    align.instantiate({{"ref", "ref.fa"}, {"reads", "a.fq"}, {"out", "a.sam"}})
+    align.exec({{"ref", "ref.fa"}, {"reads", "a.fq"}, {"out", "a.sam"}})
         .or_die_if(true);
-    align.instantiate({{"ref", "ref.fa"}, {"reads", "b.fq"}, {"out", "b.sam"},
+    align.exec({{"ref", "ref.fa"}, {"reads", "b.fq"}, {"out", "b.sam"},
                        {"preset", "map-ont"}, {"threads", "16"}})
         .or_die_if(true);
 }
@@ -253,10 +253,10 @@ int main() {
 | `slot{"name", "default"}` | Uses the default when unbound. |
 | `optional{...}` | An argv group included only when every slot inside it is bound, and dropped whole otherwise. A slot that also appears outside any group stays required. |
 
-Binding mistakes fail at instantiation, before any command runs: an unbound
+Binding mistakes fail at `exec()`, before any command runs: an unbound
 required slot reports `unbound slot: 'name'`, and a binding that no slot uses
 reports `unknown binding: 'name'`. A slot may be bound to a `temp_file` token,
-letting the caller decide per instantiation whether an output is scratch or a
+letting the caller decide per `exec()` whether an output is scratch or a
 deliverable. `proc_to(target, {...})` redirects a command's stdout to a slot or
 temp token. Predicates are stored type-erased; `RunOptions` other than the
 stdout target are fixed when the template is built.

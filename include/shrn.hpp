@@ -799,6 +799,9 @@ struct temp_file {
     std::string name;  ///< single path component, e.g. "aln.bam"; sidecars like "aln.bam.bai" live beside it
 };
 
+struct slot;
+struct optional;
+
 /// One argv element for proc(): plain text or a stage temp token.
 class Arg {
 public:
@@ -806,6 +809,9 @@ public:
     Arg(std::string text) : value_(std::move(text)) {}
     Arg(const fs::path& path) : value_(path.string()) {}
     Arg(temp_file token) : value_(std::move(token)) {}
+    // Placeholders belong to StageTemplate, which records instead of executing.
+    Arg(slot) = delete;      ///< use shrn::StageTemplate for stages with slots
+    Arg(optional) = delete;  ///< use shrn::StageTemplate for stages with optional groups
 
 private:
     friend class Outcome;
@@ -1085,7 +1091,7 @@ public:
     }
 
 private:
-    friend class StageTemplate;  ///< instantiate() starts a stage failed on binding errors
+    friend class StageTemplate;  ///< exec() starts a stage failed on binding errors
 
     void fail(std::string detail) const {
         if (code_ != 0) return;
@@ -1187,7 +1193,7 @@ private:
 
 // StageTemplate: a recorded stage with path placeholders
 
-/// A placeholder in a template, bound to a path at instantiation. A slot with
+/// A placeholder in a template, bound to a path at exec. A slot with
 /// a default is satisfied by the default when left unbound; one without is
 /// required unless it appears only inside optional groups.
 struct slot {
@@ -1224,7 +1230,7 @@ private:
 inline optional::optional(std::initializer_list<TArg> a) : args(a) {}
 
 /// A binding target: a concrete path, or a temp token so the caller decides at
-/// instantiation whether an output is scratch or a deliverable.
+/// exec whether an output is scratch or a deliverable.
 struct binding {
     std::string name;
     std::variant<std::string, temp_file> value;
@@ -1234,8 +1240,8 @@ struct binding {
     binding(std::string n, temp_file t) : name(std::move(n)), value(std::move(t)) {}
 };
 
-/// Records checks and commands once; instantiate() replays them into a fresh
-/// Outcome with slots substituted. Each instantiation owns its own temp files.
+/// Records checks and commands once; exec() replays them into a fresh
+/// Outcome with slots substituted. Each exec owns its own temp files.
 class StageTemplate {
 public:
     explicit StageTemplate(std::string name, StageOptions options = {})
@@ -1292,7 +1298,7 @@ public:
 
     /// Replay the recording with slots bound. Binding errors (an unbound
     /// required slot, or a name no slot uses) start the stage failed; nothing runs.
-    [[nodiscard]] Outcome instantiate(std::initializer_list<binding> bindings) const {
+    [[nodiscard]] Outcome exec(std::initializer_list<binding> bindings) const {
         Outcome out(name_, options_);
         std::unordered_map<std::string, std::variant<std::string, temp_file>> bound;
         for (const auto& b : bindings) bound.emplace(b.name, b.value);
