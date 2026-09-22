@@ -220,6 +220,50 @@ Pass `{.keep_temps = true}` to keep the directory:
 the process exits without running destructors; the directory survives and its
 path is printed with the error so the artifacts can be inspected.
 
+### Stage templates
+
+A `StageTemplate` records a stage's checks and commands once, with `slot`
+placeholders where paths vary. `instantiate()` binds the slots and returns an
+ordinary `Outcome`, so deadlines, joins, and temp files all work on the result.
+Each instantiation gets its own temp directory.
+
+```cpp
+#include <shrn.hpp>
+
+int main() {
+    const auto align = shrn::StageTemplate("align")
+        .expect_which("minimap2")
+        .expect_file(shrn::slot{"reads"}, shrn::file_non_empty, "non-empty")
+        .proc({"minimap2", "-a", "-t", shrn::slot{"threads", "4"},
+               shrn::optional{"-x", shrn::slot{"preset"}},
+               shrn::slot{"ref"}, shrn::slot{"reads"}, "-o", shrn::slot{"out"}})
+        .expect_file(shrn::slot{"out"}, shrn::file_non_empty, "non-empty");
+
+    align.instantiate({{"ref", "ref.fa"}, {"reads", "a.fq"}, {"out", "a.sam"}})
+        .or_die_if(true);
+    align.instantiate({{"ref", "ref.fa"}, {"reads", "b.fq"}, {"out", "b.sam"},
+                       {"preset", "map-ont"}, {"threads", "16"}})
+        .or_die_if(true);
+}
+```
+
+| Placeholder | Meaning |
+|---|---|
+| `slot{"name"}` | Required; must be bound. |
+| `slot{"name", "default"}` | Uses the default when unbound. |
+| `optional{...}` | An argv group included only when every slot inside it is bound, and dropped whole otherwise. A slot that also appears outside any group stays required. |
+
+Binding mistakes fail at instantiation, before any command runs: an unbound
+required slot reports `unbound slot: 'name'`, and a binding that no slot uses
+reports `unknown binding: 'name'`. A slot may be bound to a `temp_file` token,
+letting the caller decide per instantiation whether an output is scratch or a
+deliverable. `proc_to(target, {...})` redirects a command's stdout to a slot or
+temp token. Predicates are stored type-erased; `RunOptions` other than the
+stdout target are fixed when the template is built.
+
+Templates are fixed in shape: a variable-length list of files is not a slot.
+Build such argument vectors in the pipeline and pass them to `proc` directly.
+
 ## Files
 
 - `file_readable` and `file_non_empty` return booleans.

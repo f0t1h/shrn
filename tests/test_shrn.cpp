@@ -982,6 +982,87 @@ static void test_outcome_temps() {
     CHECK(u.size() == 36 && u[14] == '4' && u != shrn::uuid4(), "uuid4() yields distinct version-4 text");
 }
 
+// StageTemplate: recorded stages with slots
+static void test_stage_templates(const fs::path& dir) {
+    std::fprintf(stderr, "stage templates\n");
+    write_file(dir / "tpl_in1.txt", "one");
+    write_file(dir / "tpl_in2.txt", "two");
+
+    // One recipe, two instantiations: each gets its own temps and produces its own output.
+    const auto copy = shrn::StageTemplate("copy")
+                          .expect_which("cp")
+                          .expect_file(shrn::slot{"src"}, shrn::file_non_empty, "non-empty")
+                          .proc({"cp", shrn::slot{"src"}, shrn::temp_file{"scratch"}})
+                          .proc({"cp", shrn::temp_file{"scratch"}, shrn::slot{"dst"}})
+                          .expect_file(shrn::slot{"dst"});
+    fs::path t1, t2;
+    {
+        auto a = copy.instantiate({{"src", dir / "tpl_in1.txt"}, {"dst", dir / "tpl_out1.txt"}}).wait();
+        auto b = copy.instantiate({{"src", dir / "tpl_in2.txt"}, {"dst", dir / "tpl_out2.txt"}}).wait();
+        CHECK(a.ok() && b.ok(), "a template instantiates into working stages");
+        t1 = a.temp_path("scratch").parent_path();
+        t2 = b.temp_path("scratch").parent_path();
+        CHECK(t1 != t2, "each instantiation owns a separate temp directory");
+    }
+    CHECK(slurp(dir / "tpl_out1.txt") == "one" && slurp(dir / "tpl_out2.txt") == "two",
+          "slots substitute per instantiation");
+    CHECK(!fs::exists(t1) && !fs::exists(t2), "instantiated stages clean up their temps");
+
+    // Binding errors are detected before anything runs.
+    auto unbound = copy.instantiate({{"src", dir / "tpl_in1.txt"}});
+    CHECK(!unbound.ok() && unbound.detail() == "unbound slot: 'dst'", "an unbound required slot fails instantiation");
+    auto typo = copy.instantiate({{"src", dir / "tpl_in1.txt"}, {"dts", dir / "tpl_never"}});
+    CHECK(!typo.ok() && typo.detail() == "unknown binding: 'dts'", "a binding no slot uses fails instantiation");
+    CHECK(!fs::exists(dir / "tpl_never"), "a failed instantiation runs no command");
+
+    // Defaults satisfy an unbound slot and yield to an explicit binding.
+    const auto dflt = shrn::StageTemplate("default")
+                          .proc({"sh", "-c", "printf \"$0\" > \"$1\"", shrn::slot{"text", "fallback"}, shrn::slot{"out"}});
+    CHECK(dflt.instantiate({{"out", dir / "tpl_d1"}}).wait().ok() && slurp(dir / "tpl_d1") == "fallback",
+          "an unbound slot uses its default");
+    CHECK(dflt.instantiate({{"out", dir / "tpl_d2"}, {"text", "given"}}).wait().ok() && slurp(dir / "tpl_d2") == "given",
+          "a binding overrides the default");
+
+    // Optional groups are atomic: present only when every slot inside is bound.
+    const auto opt = shrn::StageTemplate("optional")
+                         .proc({"sh", "-c", "printf \"%s\" \"$@\" > \"$0\"", shrn::slot{"out"},
+                                "-1", shrn::slot{"r1"}, shrn::optional{"-2", shrn::slot{"r2"}}});
+    CHECK(opt.instantiate({{"out", dir / "tpl_o1"}, {"r1", "A"}}).wait().ok() && slurp(dir / "tpl_o1") == "-1A",
+          "an optional group with an unbound slot is dropped whole");
+    CHECK(opt.instantiate({{"out", dir / "tpl_o2"}, {"r1", "A"}, {"r2", "B"}}).wait().ok() && slurp(dir / "tpl_o2") == "-1A-2B",
+          "an optional group with all slots bound is included whole");
+    const auto mixed = shrn::StageTemplate("mixed").proc({"true", shrn::slot{"x"}, shrn::optional{"-x", shrn::slot{"x"}}});
+    CHECK(!mixed.instantiate({}).ok(), "a slot also used outside a group stays required");
+
+    // The caller decides at instantiation whether an output is scratch or a deliverable.
+    const auto emit = shrn::StageTemplate("emit").proc({"sh", "-c", "printf hi > \"$0\"", shrn::slot{"out"}});
+    {
+        auto scratch = emit.instantiate({{"out", shrn::temp_file{"s.txt"}}}).wait();
+        CHECK(scratch.ok() && slurp(scratch.temp_path("s.txt")) == "hi", "a slot bound to a temp token writes into the stage temps");
+    }
+    CHECK(emit.instantiate({{"out", dir / "tpl_deliver.txt"}}).wait().ok() && slurp(dir / "tpl_deliver.txt") == "hi",
+          "the same slot bound to a path writes a deliverable");
+
+    // proc_to redirects stdout into a slot or a temp token.
+    const auto redirect = shrn::StageTemplate("redirect")
+                              .proc_to(shrn::slot{"log"}, {"sh", "-c", "echo captured"})
+                              .expect_file(shrn::slot{"log"}, shrn::file_non_empty, "non-empty");
+    CHECK(redirect.instantiate({{"log", dir / "tpl_log.txt"}}).wait().ok() && slurp(dir / "tpl_log.txt") == "captured\n",
+          "proc_to binds stdout to a slot");
+    const auto redirect_tmp = shrn::StageTemplate("redirect tmp")
+                                  .proc_to(shrn::temp_file{"o"}, {"echo", "x"})
+                                  .expect_file(shrn::temp_file{"o"});
+    CHECK(redirect_tmp.instantiate({}).wait().ok(), "proc_to binds stdout to a temp token");
+
+    fs::path kept;
+    {
+        auto k = shrn::StageTemplate("keep", {.keep_temps = true}).proc({"touch", shrn::temp_file{"k"}}).instantiate({}).wait();
+        kept = k.temp_path("k").parent_path();
+    }
+    CHECK(fs::exists(kept / "k"), "keep_temps carries through instantiation");
+    fs::remove_all(kept);
+}
+
 int main(int argc, char** argv) {
     init_self_exe(argv[0]);
     if (argc >= 2) {
@@ -1006,6 +1087,7 @@ int main(int argc, char** argv) {
     test_outcome(root);
     test_outcome_async(root);
     test_outcome_temps();
+    test_stage_templates(root);
 
     std::error_code ec;
     fs::remove_all(root, ec);

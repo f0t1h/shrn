@@ -853,19 +853,7 @@ public:
 
     /// Braced argument lists may mix text with temp_file tokens.
     Outcome& proc(std::initializer_list<Arg> args, const RunOptions& opts = {}) & {
-        if (!ok()) return *this;
-        std::vector<std::string> resolved;
-        resolved.reserve(args.size());
-        for (const Arg& a : args) {
-            if (const auto* token = std::get_if<temp_file>(&a.value_)) {
-                const fs::path* p = resolve(*token);
-                if (!p) return *this;  // resolve() recorded the failure
-                resolved.push_back(p->string());
-            } else {
-                resolved.push_back(std::get<std::string>(a.value_));
-            }
-        }
-        return proc(resolved, opts);
+        return proc_args(args.begin(), args.end(), opts);
     }
     Outcome&& proc(std::initializer_list<Arg> args, const RunOptions& opts = {}) && {
         return std::move(proc(args, opts));
@@ -1097,6 +1085,8 @@ public:
     }
 
 private:
+    friend class StageTemplate;  ///< instantiate() starts a stage failed on binding errors
+
     void fail(std::string detail) const {
         if (code_ != 0) return;
         code_ = EXIT_FAILURE;
@@ -1118,6 +1108,23 @@ private:
     }
 
     // --- stage temp files -------------------------------------------------
+
+    /// Shared by the braced proc() and template replay: resolve tokens, then spawn.
+    Outcome& proc_args(const Arg* first, const Arg* last, const RunOptions& opts) {
+        if (!ok()) return *this;
+        std::vector<std::string> resolved;
+        resolved.reserve(static_cast<std::size_t>(last - first));
+        for (const Arg* a = first; a != last; ++a) {
+            if (const auto* token = std::get_if<temp_file>(&a->value_)) {
+                const fs::path* p = resolve(*token);
+                if (!p) return *this;  // resolve() recorded the failure
+                resolved.push_back(p->string());
+            } else {
+                resolved.push_back(std::get<std::string>(a->value_));
+            }
+        }
+        return proc(resolved, opts);
+    }
 
     /// Resolve a token to its path inside the stage temp directory, creating the
     /// directory on first use. Records a stage failure and returns null on error.
@@ -1177,6 +1184,234 @@ private:
     outcome.proc(args, opts);
     return outcome;
 }
+
+// StageTemplate: a recorded stage with path placeholders
+
+/// A placeholder in a template, bound to a path at instantiation. A slot with
+/// a default is satisfied by the default when left unbound; one without is
+/// required unless it appears only inside optional groups.
+struct slot {
+    std::string name;
+    std::optional<std::string> default_value;
+    explicit slot(std::string n) : name(std::move(n)) {}
+    slot(std::string n, std::string d) : name(std::move(n)), default_value(std::move(d)) {}
+};
+
+class TArg;
+
+/// An argv fragment included whole when every slot inside it is bound (or
+/// defaulted), and dropped whole otherwise: `optional{"-2", slot{"r2"}}`.
+struct optional {
+    std::vector<TArg> args;
+    optional(std::initializer_list<TArg> a);
+};
+
+/// One template argv element: text, a temp token, a slot, or an optional group.
+class TArg {
+public:
+    TArg(const char* text) : value_(std::string(text)) {}
+    TArg(std::string text) : value_(std::move(text)) {}
+    TArg(const fs::path& path) : value_(path.string()) {}
+    TArg(temp_file token) : value_(std::move(token)) {}
+    TArg(slot s) : value_(std::move(s)) {}
+    TArg(optional group) : value_(std::make_shared<optional>(std::move(group))) {}
+
+private:
+    friend class StageTemplate;
+    std::variant<std::string, temp_file, slot, std::shared_ptr<optional>> value_;
+};
+
+inline optional::optional(std::initializer_list<TArg> a) : args(a) {}
+
+/// A binding target: a concrete path, or a temp token so the caller decides at
+/// instantiation whether an output is scratch or a deliverable.
+struct binding {
+    std::string name;
+    std::variant<std::string, temp_file> value;
+    binding(std::string n, const fs::path& p) : name(std::move(n)), value(p.string()) {}
+    binding(std::string n, const char* p) : name(std::move(n)), value(std::string(p)) {}
+    binding(std::string n, std::string p) : name(std::move(n)), value(std::move(p)) {}
+    binding(std::string n, temp_file t) : name(std::move(n)), value(std::move(t)) {}
+};
+
+/// Records checks and commands once; instantiate() replays them into a fresh
+/// Outcome with slots substituted. Each instantiation owns its own temp files.
+class StageTemplate {
+public:
+    explicit StageTemplate(std::string name, StageOptions options = {})
+        : name_(std::move(name)), options_(options) {}
+
+    StageTemplate& expect_which(std::string tool) & {
+        Step& s = add(Step::which);
+        s.text = std::move(tool);
+        return *this;
+    }
+    StageTemplate&& expect_which(std::string tool) && { return std::move(expect_which(std::move(tool))); }
+
+    StageTemplate& expect_file(TArg path) & {
+        add(Step::file).args.push_back(std::move(path));
+        return *this;
+    }
+    StageTemplate&& expect_file(TArg path) && { return std::move(expect_file(std::move(path))); }
+
+    template <class Pred>
+        requires std::is_invocable_r_v<bool, Pred, const fs::path&>
+    StageTemplate& expect_file(TArg path, Pred&& pred, std::string what) & {
+        Step& s = add(Step::file_pred);
+        s.args.push_back(std::move(path));
+        s.text = std::move(what);
+        s.pred = std::forward<Pred>(pred);
+        return *this;
+    }
+    template <class Pred>
+        requires std::is_invocable_r_v<bool, Pred, const fs::path&>
+    StageTemplate&& expect_file(TArg path, Pred&& pred, std::string what) && {
+        return std::move(expect_file(std::move(path), std::forward<Pred>(pred), std::move(what)));
+    }
+
+    /// stdout_file in `opts` is fixed text; use `proc_to` to redirect stdout into a slot.
+    StageTemplate& proc(std::initializer_list<TArg> args, RunOptions opts = {}) & {
+        Step& s = add(Step::command);
+        s.args.assign(args.begin(), args.end());
+        s.opts = std::move(opts);
+        return *this;
+    }
+    StageTemplate&& proc(std::initializer_list<TArg> args, RunOptions opts = {}) && {
+        return std::move(proc(args, std::move(opts)));
+    }
+
+    /// Like proc(), redirecting the command's stdout to a slot or temp token.
+    StageTemplate& proc_to(TArg stdout_target, std::initializer_list<TArg> args, RunOptions opts = {}) & {
+        proc(args, std::move(opts));
+        steps_.back().stdout_target = std::move(stdout_target);
+        return *this;
+    }
+    StageTemplate&& proc_to(TArg stdout_target, std::initializer_list<TArg> args, RunOptions opts = {}) && {
+        return std::move(proc_to(std::move(stdout_target), args, std::move(opts)));
+    }
+
+    /// Replay the recording with slots bound. Binding errors (an unbound
+    /// required slot, or a name no slot uses) start the stage failed; nothing runs.
+    [[nodiscard]] Outcome instantiate(std::initializer_list<binding> bindings) const {
+        Outcome out(name_, options_);
+        std::unordered_map<std::string, std::variant<std::string, temp_file>> bound;
+        for (const auto& b : bindings) bound.emplace(b.name, b.value);
+
+        // Validate before anything runs: every bound name must be a slot.
+        std::unordered_map<std::string, bool> required;  // name -> appears outside every optional group
+        for (const auto& s : steps_) collect(s, required);
+        for (const auto& [n, _] : bound) {
+            if (!required.count(n)) {
+                out.fail("unknown binding: '" + n + "'");
+                return out;
+            }
+        }
+        for (const auto& [n, req] : required) {
+            if (req && !bound.count(n) && !defaults_.count(n)) {
+                out.fail("unbound slot: '" + n + "'");
+                return out;
+            }
+        }
+
+        for (const auto& s : steps_) {
+            switch (s.kind) {
+                case Step::which:
+                    out.expect_which(s.text);
+                    break;
+                case Step::file: {
+                    auto arg = lower(s.args.front(), bound);
+                    if (arg) std::visit([&](auto&& v) { out.expect_file(v); }, *arg);
+                    break;
+                }
+                case Step::file_pred: {
+                    auto arg = lower(s.args.front(), bound);
+                    if (arg) std::visit([&](auto&& v) { out.expect_file(v, s.pred, s.text); }, *arg);
+                    break;
+                }
+                case Step::command: {
+                    std::vector<Arg> argv;
+                    for (const auto& a : s.args) append(a, bound, argv);
+                    RunOptions opts = s.opts;
+                    if (s.stdout_target) {
+                        auto target = lower(*s.stdout_target, bound);
+                        if (target) {
+                            if (auto* t = std::get_if<temp_file>(&*target)) opts.stdout_file = out.temp_path(t->name);
+                            else opts.stdout_file = std::get<std::string>(*target);
+                        }
+                    }
+                    out.proc_args(argv.data(), argv.data() + argv.size(), opts);
+                    break;
+                }
+            }
+        }
+        return out;
+    }
+
+private:
+    struct Step {
+        enum Kind { which, file, file_pred, command } kind;
+        std::vector<TArg> args;
+        std::string text;  ///< tool name, or predicate label
+        RunOptions opts;
+        std::function<bool(const fs::path&)> pred;
+        std::optional<TArg> stdout_target;
+    };
+
+    Step& add(Step::Kind kind) {
+        steps_.push_back(Step{});
+        steps_.back().kind = kind;
+        return steps_.back();
+    }
+
+    using Bound = std::unordered_map<std::string, std::variant<std::string, temp_file>>;
+
+    /// Record every slot name; `required` is true if it occurs outside all optional groups.
+    void collect(const Step& s, std::unordered_map<std::string, bool>& required) const {
+        for (const auto& a : s.args) collect(a, required, true);
+        if (s.stdout_target) collect(*s.stdout_target, required, true);
+    }
+    void collect(const TArg& a, std::unordered_map<std::string, bool>& required, bool top) const {
+        if (const auto* s = std::get_if<slot>(&a.value_)) {
+            if (s->default_value) defaults_.emplace(s->name, *s->default_value);
+            auto [it, _] = required.try_emplace(s->name, false);
+            if (top) it->second = true;
+        } else if (const auto* g = std::get_if<std::shared_ptr<optional>>(&a.value_)) {
+            for (const auto& inner : (*g)->args) collect(inner, required, false);
+        }
+    }
+
+    /// A single (non-group) template argument as the concrete value it stands for.
+    std::optional<std::variant<std::string, temp_file>> lower(const TArg& a, const Bound& bound) const {
+        if (const auto* text = std::get_if<std::string>(&a.value_)) return *text;
+        if (const auto* t = std::get_if<temp_file>(&a.value_)) return *t;
+        if (const auto* s = std::get_if<slot>(&a.value_)) {
+            if (auto it = bound.find(s->name); it != bound.end()) return it->second;
+            if (s->default_value) return *s->default_value;
+            return std::nullopt;  // only reachable inside an optional group
+        }
+        return std::nullopt;
+    }
+
+    /// Expand one template argument into argv, dropping optional groups with unbound slots.
+    void append(const TArg& a, const Bound& bound, std::vector<Arg>& argv) const {
+        if (const auto* g = std::get_if<std::shared_ptr<optional>>(&a.value_)) {
+            std::vector<Arg> group;
+            for (const auto& inner : (*g)->args) {
+                auto v = lower(inner, bound);
+                if (!v) return;  // an unbound slot drops the whole group
+                std::visit([&](auto&& x) { group.emplace_back(std::move(x)); }, std::move(*v));
+            }
+            for (auto& x : group) argv.push_back(std::move(x));
+            return;
+        }
+        if (auto v = lower(a, bound)) std::visit([&](auto&& x) { argv.emplace_back(std::move(x)); }, std::move(*v));
+    }
+
+    std::string name_;
+    StageOptions options_;
+    std::vector<Step> steps_;
+    mutable std::unordered_map<std::string, std::string> defaults_;  ///< filled by collect()
+};
 
 }  // namespace shrn
 
