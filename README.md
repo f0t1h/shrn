@@ -226,18 +226,6 @@ path is printed with the error so the artifacts can be inspected.
 - `file_readable` and `file_non_empty` return booleans.
 - `ensure_directory` creates missing parent directories.
 
-## Temporary files
-
-`make_temp_file` and `make_temp_dir` create paths in `$TMPDIR`, or `/tmp` when
-unset or empty. Their `_in` variants take a destination directory. A failed
-creation returns an empty path; the caller is responsible for removing created
-paths.
-
-`TempFile::create` and `TempDir::create` return move-only owners; a failed
-creation yields an empty owner (test with `operator bool`). Destruction or
-`reset()` removes the file or directory tree; cleanup errors are ignored.
-`release()` returns the path and disables automatic removal.
-
 ## Integration
 
 CMake, FetchContent:

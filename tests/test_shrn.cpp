@@ -236,42 +236,6 @@ static void test_files(const fs::path& dir) {
     CHECK(!shrn::ensure_directory(text), "ensure_directory over a file fails");
 }
 
-// temp
-static void test_temp(const fs::path& dir) {
-    std::fprintf(stderr, "temp\n");
-
-    auto a = shrn::make_temp_file_in(dir, "t_", ".fq");
-    auto b = shrn::make_temp_file_in(dir, "t_", ".fq");
-    CHECK(!a.empty() && !b.empty() && a != b, "temp files unique");
-    CHECK(a.extension() == ".fq" && a.filename().string().rfind("t_", 0) == 0, "prefix/suffix honored");
-    CHECK(fs::exists(a) && fs::file_size(a) == 0, "temp file created empty");
-
-    auto bad = shrn::make_temp_file_in(dir / "nope", "t_");
-    CHECK(bad.empty(), "temp in missing dir fails");
-
-    fs::path kept;
-    fs::path removed;
-    {
-        auto tf = shrn::TempFile::create_in(dir, ".tmp");
-        CHECK(tf, "TempFile created");
-        removed = tf.path();
-        auto tf2 = shrn::TempFile::create_in(dir);
-        kept = tf2.release();
-        CHECK(!tf2, "released TempFile is empty");
-    }
-    CHECK(!fs::exists(removed), "TempFile removed on scope exit");
-    CHECK(fs::exists(kept), "released file kept");
-
-    fs::path tree;
-    {
-        auto td = shrn::TempDir::create_in(dir);
-        CHECK(td && fs::is_directory(td.path()), "TempDir created");
-        tree = td.path();
-        write_file(td / "inner.txt", "x");
-    }
-    CHECK(!fs::exists(tree), "TempDir removed recursively");
-}
-
 // process
 static void test_which(const fs::path& dir) {
     auto previous_dir = fs::current_path();
@@ -1027,22 +991,24 @@ int main(int argc, char** argv) {
             return helper_main(std::string(first.substr(prefix.size())), argc >= 3 ? argv[2] : "",
                                argc >= 4 ? argv[3] : "");
     }
-    auto root = shrn::TempDir::create("shrn_test_");
-    if (!root) {
+    std::string tmpl = (fs::temp_directory_path() / "shrn_test_XXXXXX").string();
+    if (!::mkdtemp(tmpl.data())) {
         std::fprintf(stderr, "cannot create temp dir\n");
         return 2;
     }
+    const fs::path root(tmpl);
 
-    test_files(root.path());
-    test_temp(root.path());
-    test_which(root.path());
-    test_process(root.path());
-    test_process_edges(root.path());
-    test_process_spawn(root.path());
-    test_outcome(root.path());
-    test_outcome_async(root.path());
+    test_files(root);
+    test_which(root);
+    test_process(root);
+    test_process_edges(root);
+    test_process_spawn(root);
+    test_outcome(root);
+    test_outcome_async(root);
     test_outcome_temps();
 
+    std::error_code ec;
+    fs::remove_all(root, ec);
     std::fprintf(stderr, "%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }

@@ -106,7 +106,9 @@ struct unique_fd {
 }
 
 
-// Temporary files
+// Temporary directories (stage-internal; see temp_file)
+
+namespace detail {
 
 /// $TMPDIR if set and non-empty, else /tmp.
 [[nodiscard]] inline fs::path temp_directory() {
@@ -114,38 +116,57 @@ struct unique_fd {
     return (t && *t) ? fs::path(t) : fs::path("/tmp");
 }
 
-/// Atomically create an empty file `dir/<prefix>XXXXXX<suffix>` (mkstemps).
-/// Returns an empty path on failure; errno_string() describes why.
-[[nodiscard]] inline fs::path make_temp_file_in(const fs::path& dir,
-                                                std::string_view prefix = "shrn_",
-                                                std::string_view suffix = "") {
-    std::string tmpl = (dir / std::string(prefix)).string();
-    tmpl += "XXXXXX";
-    tmpl.append(suffix);
-    int fd = ::mkstemps(tmpl.data(), static_cast<int>(suffix.size()));
-    if (fd == -1) return {};
-    ::close(fd);
-    return fs::path(std::move(tmpl));
-}
+/// Owns a temp directory tree; removed recursively on destruction unless released.
+class TempDir {
+public:
+    TempDir() = default;
 
-/// Create a file in temp_directory(); the caller is responsible for removal.
-[[nodiscard]] inline fs::path make_temp_file(std::string_view prefix = "shrn_",
-                                             std::string_view suffix = "") {
-    return make_temp_file_in(temp_directory(), prefix, suffix);
-}
+    /// Atomically create `$TMPDIR/<prefix>XXXXXX` (mkdtemp). Failure yields an
+    /// empty owner (operator bool is false); errno_string() describes why.
+    [[nodiscard]] static TempDir create(std::string_view prefix) {
+        std::string tmpl = (temp_directory() / std::string(prefix)).string();
+        tmpl += "XXXXXX";
+        if (!::mkdtemp(tmpl.data())) return {};
+        return TempDir(fs::path(std::move(tmpl)));
+    }
 
-/// Atomically create a directory `dir/<prefix>XXXXXX` (mkdtemp).
-/// Returns an empty path on failure; errno_string() describes why.
-[[nodiscard]] inline fs::path make_temp_dir_in(const fs::path& dir, std::string_view prefix = "shrn_") {
-    std::string tmpl = (dir / std::string(prefix)).string();
-    tmpl += "XXXXXX";
-    if (!::mkdtemp(tmpl.data())) return {};
-    return fs::path(std::move(tmpl));
-}
+    ~TempDir() { reset(); }
+    TempDir(const TempDir&) = delete;
+    TempDir& operator=(const TempDir&) = delete;
+    TempDir(TempDir&& o) noexcept : path_(std::move(o.path_)) { o.path_.clear(); }
+    TempDir& operator=(TempDir&& o) noexcept {
+        if (this != &o) {
+            reset();
+            path_ = std::move(o.path_);
+            o.path_.clear();
+        }
+        return *this;
+    }
 
-[[nodiscard]] inline fs::path make_temp_dir(std::string_view prefix = "shrn_") {
-    return make_temp_dir_in(temp_directory(), prefix);
-}
+    [[nodiscard]] const fs::path& path() const noexcept { return path_; }
+    explicit operator bool() const noexcept { return !path_.empty(); }
+
+    /// Remove the tree and clear ownership; ignore cleanup errors.
+    void reset() noexcept {
+        if (!path_.empty()) {
+            std::error_code ec;
+            fs::remove_all(path_, ec);
+            path_.clear();
+        }
+    }
+    /// Give up ownership without removing anything.
+    fs::path release() noexcept {
+        fs::path p = std::move(path_);
+        path_.clear();
+        return p;
+    }
+
+private:
+    explicit TempDir(fs::path p) noexcept : path_(std::move(p)) {}
+    fs::path path_;
+};
+
+}  // namespace detail
 
 /// Random RFC 4122 version-4 UUID text; falls back to clock and pid entropy
 /// if /dev/urandom is unavailable. Never throws.
@@ -186,106 +207,6 @@ struct unique_fd {
     return out;
 }
 
-/// Owns a temp file; removed on destruction unless released.
-class TempFile {
-public:
-    TempFile() = default;
-
-    /// Failed creation yields an empty TempFile (operator bool is false).
-    [[nodiscard]] static TempFile create(std::string_view suffix = "", std::string_view prefix = "shrn_") {
-        return TempFile(make_temp_file(prefix, suffix));
-    }
-    [[nodiscard]] static TempFile create_in(const fs::path& dir,
-                                            std::string_view suffix = "",
-                                            std::string_view prefix = "shrn_") {
-        return TempFile(make_temp_file_in(dir, prefix, suffix));
-    }
-
-    ~TempFile() { reset(); }
-    TempFile(const TempFile&) = delete;
-    TempFile& operator=(const TempFile&) = delete;
-    TempFile(TempFile&& o) noexcept : path_(std::move(o.path_)) { o.path_.clear(); }
-    TempFile& operator=(TempFile&& o) noexcept {
-        if (this != &o) {
-            reset();
-            path_ = std::move(o.path_);
-            o.path_.clear();
-        }
-        return *this;
-    }
-
-    [[nodiscard]] const fs::path& path() const noexcept { return path_; }
-    [[nodiscard]] std::string string() const { return path_.string(); }
-    explicit operator bool() const noexcept { return !path_.empty(); }
-
-    /// Remove the file and clear ownership; ignore cleanup errors.
-    void reset() noexcept {
-        if (!path_.empty()) {
-            std::error_code ec;
-            fs::remove(path_, ec);
-            path_.clear();
-        }
-    }
-    /// Return the path without removing the file.
-    [[nodiscard]] fs::path release() noexcept {
-        fs::path p = std::move(path_);
-        path_.clear();
-        return p;
-    }
-
-private:
-    explicit TempFile(fs::path p) noexcept : path_(std::move(p)) {}
-    fs::path path_;
-};
-
-/// Owns a temp directory tree; removed recursively on destruction unless released.
-class TempDir {
-public:
-    TempDir() = default;
-
-    /// Failed creation yields an empty TempDir (operator bool is false).
-    [[nodiscard]] static TempDir create(std::string_view prefix = "shrn_") {
-        return TempDir(make_temp_dir(prefix));
-    }
-    [[nodiscard]] static TempDir create_in(const fs::path& dir, std::string_view prefix = "shrn_") {
-        return TempDir(make_temp_dir_in(dir, prefix));
-    }
-
-    ~TempDir() { reset(); }
-    TempDir(const TempDir&) = delete;
-    TempDir& operator=(const TempDir&) = delete;
-    TempDir(TempDir&& o) noexcept : path_(std::move(o.path_)) { o.path_.clear(); }
-    TempDir& operator=(TempDir&& o) noexcept {
-        if (this != &o) {
-            reset();
-            path_ = std::move(o.path_);
-            o.path_.clear();
-        }
-        return *this;
-    }
-
-    [[nodiscard]] const fs::path& path() const noexcept { return path_; }
-    [[nodiscard]] std::string string() const { return path_.string(); }
-    explicit operator bool() const noexcept { return !path_.empty(); }
-    [[nodiscard]] fs::path operator/(const fs::path& rel) const { return path_ / rel; }
-
-    void reset() noexcept {
-        if (!path_.empty()) {
-            std::error_code ec;
-            fs::remove_all(path_, ec);
-            path_.clear();
-        }
-    }
-    [[nodiscard]] fs::path release() noexcept {
-        fs::path p = std::move(path_);
-        path_.clear();
-        return p;
-    }
-
-private:
-    explicit TempDir(fs::path p) noexcept : path_(std::move(p)) {}
-    fs::path path_;
-};
 
 // Process execution
 
@@ -1211,7 +1132,7 @@ private:
             for (char c : name_.empty() ? std::string("stage") : name_)
                 prefix += (std::isalnum(static_cast<unsigned char>(c)) ? c : '_');
             prefix += '_' + std::to_string(::getpid()) + '_' + uuid4() + '_';
-            temp_dir_ = TempDir::create(prefix);
+            temp_dir_ = detail::TempDir::create(prefix);
             if (!*temp_dir_) {
                 temp_dir_.reset();
                 fail("cannot create temp dir: " + detail::errno_string());
@@ -1241,7 +1162,7 @@ private:
     mutable std::string detail_;
     mutable std::string stderr_;
     mutable std::optional<Process> pending_;
-    std::optional<TempDir> temp_dir_;                    ///< created on first temp_file use
+    std::optional<detail::TempDir> temp_dir_;            ///< created on first temp_file use
     std::unordered_map<std::string, fs::path> temp_paths_;  ///< name -> resolved path
 };
 
