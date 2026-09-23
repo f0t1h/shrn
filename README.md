@@ -180,6 +180,45 @@ It does not clean up sibling stages; `std::exit` does not destroy local objects.
 but does not clear the failed state. `with_error` and `with_stderr` replace the
 stored text; they do not mark the stage as failed.
 
+### Argument lists
+
+Braced `proc({...})` lists take more than strings. Each element yields zero,
+one, or several argv entries, so a command line is written in one place with
+no `push_back` bookkeeping:
+
+| element | yields |
+|---|---|
+| text, `std::filesystem::path`, integer | one entry |
+| `std::optional<T>` | its value, or nothing |
+| `each(vector)` | every item, in place |
+| `{flag, value}` | the flag before each entry the value yields; nothing when it yields nothing |
+| `in(x)`, `out(x)` | `x`, marked for freshness (see below) |
+
+A flag/value pair whose value is an empty optional simply disappears, which is
+how conditional arguments are expressed:
+
+```cpp
+#include <shrn.hpp>
+#include <optional>
+
+int main(int argc, char** argv) {
+    std::optional<std::filesystem::path> mate = argc > 2 ? std::optional(argv[2]) : std::nullopt;
+    std::vector<std::filesystem::path> refs = {"a.fa", "b.fa"};
+    shrn::stage("align")
+        .proc({"printf", "%s\\n",
+               {"-1", shrn::in(argv[1])},
+               {"-2", shrn::in(mate)},     // absent -> no -2 at all
+               {"-t", 8},
+               {"-r", shrn::each(refs)}})  // -r a.fa -r b.fa
+        .or_die_if(true);
+}
+```
+
+The same shapes work in templates. There a pair whose value is a `slot`
+drops when the slot is unbound, so `{"-2", slot{"r2"}}` is an optional
+argument while a bare `slot{"r1"}` stays required; a pair whose value is
+`many{...}` repeats the flag per bound item.
+
 ### Stage temp files
 
 `temp_file{"name"}` names a file in a private directory owned by the stage.
@@ -378,7 +417,7 @@ CMake, FetchContent:
 include(FetchContent)
 FetchContent_Declare(shrn
     GIT_REPOSITORY https://github.com/f0t1h/shrn.git
-    GIT_TAG        v0.10.0)
+    GIT_TAG        v0.11.0)
 FetchContent_MakeAvailable(shrn)
 target_link_libraries(your_target PRIVATE shrn::shrn)
 ```

@@ -1283,6 +1283,61 @@ static void test_freshness(const fs::path& dir) {
     CHECK(tcall.launch({{"p", dir / "fresh_absent"}}).ok() && tcalls == 1, "a template call() runs when its out() is missing");
 }
 
+// Argv shapes: pairs, nil, each
+static void test_argv_shapes(const fs::path& dir) {
+    std::fprintf(stderr, "argv shapes\n");
+    const fs::path log = dir / "argv.txt";
+    shrn::RunOptions to_log;
+    to_log.stdout_file = log;
+    auto lines = [&] { return slurp(log); };
+
+    std::optional<fs::path> none, some = fs::path("r2.fq");
+    const std::vector<fs::path> reads = {"a.fq", "b.fq"};
+
+    CHECK(shrn::stage("s").proc({"printf", "%s\\n", "x", fs::path("p"), 7}, to_log).wait().ok() && lines() == "x\np\n7\n",
+          "singles: text, path, and integers format as before");
+    CHECK(shrn::stage("s").proc({"printf", "%s\\n", {"-o", "dir"}, {"-t", 16}}, to_log).wait().ok() && lines() == "-o\ndir\n-t\n16\n",
+          "a pair yields flag then value");
+    CHECK(shrn::stage("s").proc({"printf", "%s\\n", {"-2", none}, {"-1", some}}, to_log).wait().ok() && lines() == "-1\nr2.fq\n",
+          "a pair with an empty optional vanishes; a present one stays");
+    CHECK(shrn::stage("s").proc({"printf", "%s\\n", none, some}, to_log).wait().ok() && lines() == "r2.fq\n",
+          "a bare empty optional splices to nothing");
+    CHECK(shrn::stage("s").proc({"printf", "%s\\n", shrn::each(reads), {"-l", shrn::each(reads)}}, to_log).wait().ok() &&
+              lines() == "a.fq\nb.fq\n-l\na.fq\n-l\nb.fq\n",
+          "each() splices in place; as a pair value it repeats the flag");
+
+    // Tags travel through pairs and drive freshness.
+    const fs::path src = dir / "shape_in", dst = dir / "shape_out", marker = dir / "shape_ran";
+    write_file(src, "x");
+    write_file(dst, "y");
+    touch_newer(dst);
+    CHECK(shrn::stage("s").proc({"touch", marker, {"-i", shrn::in(src)}, {"-o", shrn::out(dst)}}).wait().ok() && !fs::exists(marker),
+          "in()/out() inside pairs guard the command");
+    CHECK(shrn::stage("s").proc({"touch", marker, {"-o", shrn::out(std::optional<fs::path>{})}}).wait().ok() && fs::exists(marker),
+          "an absent tagged value declares no output");
+
+    // Templates: a pair with a slot is optional; singles remain required; lists repeat.
+    const auto t = shrn::StageTemplate("t").proc_to(shrn::slot{"o"}, {"printf", "%s\\n", {"-1", shrn::slot{"r1"}}, {"-2", shrn::slot{"r2"}},
+                                                                      {"-l", shrn::many{"reads"}}, {"-t", 3}});
+    CHECK(t.launch({{"o", log}, {"r1", fs::path("R1")}, {"reads", reads}}).wait().ok() && lines() == "-1\nR1\n-l\na.fq\n-l\nb.fq\n-t\n3\n",
+          "template pairs: bound slot kept, unbound dropped, list repeated");
+    CHECK(t.launch({{"o", log}, {"r2", fs::path("R2")}, {"reads", std::vector<fs::path>{}}}).wait().ok() && lines() == "-2\nR2\n-t\n3\n",
+          "template pairs: an empty list yields nothing, no slot is required");
+    auto req = shrn::StageTemplate("req").proc({"true", "-1", shrn::slot{"r1"}}).launch({});
+    CHECK(!req.ok() && req.detail() == "unbound slot: 'r1'", "a slot outside a pair stays required");
+    const auto tagged = shrn::StageTemplate("tagged").proc({"touch", shrn::slot{"m"}, {"-i", shrn::in(shrn::slot{"src"})}, {"-o", shrn::out(shrn::slot{"dst"})}});
+    fs::remove(marker);
+    CHECK(tagged.launch({{"m", marker}, {"src", src}, {"dst", dst}}).wait().ok() && !fs::exists(marker),
+          "tags on template pair values guard the launched command");
+    const auto spliced = shrn::StageTemplate("spliced").proc_to(shrn::slot{"o"}, {"printf", "%s\\n", shrn::in(shrn::each(reads)), {"-q", std::optional<int>{}}, {"-n", std::optional<int>{9}}});
+    CHECK(spliced.launch({{"o", log}}).wait().ok() && lines() == "a.fq\nb.fq\n-n\n9\n", "each() and optionals resolve when the template is built");
+
+    static_assert(!std::is_constructible_v<shrn::Arg, shrn::many>, "lists stay template-only");
+    static_assert(std::is_constructible_v<shrn::Arg, const char*, int>, "flag/value pairs construct an Arg");
+    static_assert(!std::is_constructible_v<shrn::Arg, fs::path, int>, "a path is not a flag");
+    static_assert(!std::is_constructible_v<shrn::Arg, const char*, bool>, "bools do not format");
+}
+
 int main(int argc, char** argv) {
     init_self_exe(argv[0]);
     if (argc >= 2) {
@@ -1310,6 +1365,7 @@ int main(int argc, char** argv) {
     test_stage_templates(root);
     test_temp_dir_option(root);
     test_freshness(root);
+    test_argv_shapes(root);
 
     std::error_code ec;
     fs::remove_all(root, ec);

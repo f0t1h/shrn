@@ -8,6 +8,7 @@
 #include <cctype>
 #include <cerrno>
 #include <chrono>
+#include <concepts>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -15,6 +16,7 @@
 #include <filesystem>
 #include <functional>
 #include <initializer_list>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <string>
@@ -810,9 +812,10 @@ struct temp_file {
 };
 
 struct slot;
+struct many;
 struct optional;
 
-/// Freshness roles: mark an argv element as a file the command reads or writes.
+/// Freshness roles: mark an argv value as a file the command reads or writes.
 /// A command with any `out` is skipped when every output exists and none is
 /// older than any `in` (see fresh()), unless the stage was created with force.
 template <class T>
@@ -826,39 +829,103 @@ struct out {
     explicit out(T v) : value(std::move(v)) {}
 };
 
+/// A list spliced into argv in place: `each(paths)`. As the value of a pair,
+/// `{"-l", each(paths)}` repeats the flag before every item.
+template <class T>
+struct each {
+    std::vector<T> items;
+    explicit each(std::vector<T> v) : items(std::move(v)) {}
+};
+
 namespace detail {
 enum class Role { none, input, output };
 template <class T> struct tag { static constexpr Role role = Role::none; };
-template <class T> struct tag<in<T>> { using inner = T; static constexpr Role role = Role::input; };
-template <class T> struct tag<out<T>> { using inner = T; static constexpr Role role = Role::output; };
+template <class T> struct tag<in<T>> { static constexpr Role role = Role::input; };
+template <class T> struct tag<out<T>> { static constexpr Role role = Role::output; };
 template <class T> constexpr Role role_of = tag<std::remove_cvref_t<T>>::role;
 template <class T> constexpr bool tagged = role_of<T> != Role::none;
+template <class F> concept flag_text = std::is_convertible_v<F, std::string_view>;
+template <class I> concept argv_number = std::integral<I> && !std::is_same_v<I, bool>;
+
+/// Storage shared by Arg and TArg: one element inline, several in a vector.
+template <class E>
+class elems {
+public:
+    const E* begin() const noexcept { return data(); }
+    const E* end() const noexcept { return data() + size(); }
+    std::size_t size() const noexcept {
+        return std::holds_alternative<E>(v_) ? 1 : std::get<std::vector<E>>(v_).size();
+    }
+
+protected:
+    elems() : v_(std::vector<E>{}) {}
+    explicit elems(E e) : v_(std::move(e)) {}
+    E* begin() noexcept { return const_cast<E*>(data()); }
+    E* end() noexcept { return begin() + size(); }
+    std::vector<E>& list() { return std::get<std::vector<E>>(v_); }
+    void take(elems&& other) {
+        auto& out = list();
+        for (E& e : other) out.push_back(std::move(e));
+    }
+
+private:
+    const E* data() const noexcept {
+        if (const E* e = std::get_if<E>(&v_)) return e;
+        return std::get<std::vector<E>>(v_).data();
+    }
+    std::variant<E, std::vector<E>> v_;
+};
 }  // namespace detail
 
-/// One argv element for proc(): plain text or a stage temp token, optionally
-/// tagged with in()/out().
-class Arg {
+/// One resolved argv element: text or a stage temp token, with its freshness role.
+struct ArgElem {
+    std::variant<std::string, temp_file> value;
+    detail::Role role = detail::Role::none;
+};
+
+/**
+ * Argv for proc(): each Arg yields zero, one, or several elements.
+ *
+ *   text, path, temp token, integer   one element
+ *   std::optional<T>                  the element(s) of its value, or nothing
+ *   each(vector)                      every item, in place
+ *   {flag, value}                     flag before each element the value yields;
+ *                                     nothing when the value yields nothing
+ *   in(x), out(x)                     x, marked as read / written for freshness
+ */
+class Arg : public detail::elems<ArgElem> {
 public:
-    Arg(const char* text) : value_(std::string(text)) {}
-    Arg(std::string text) : value_(std::move(text)) {}
-    Arg(const fs::path& path) : value_(path.string()) {}
-    Arg(temp_file token) : value_(std::move(token)) {}
+    Arg(const char* text) : elems(ArgElem{std::string(text)}) {}
+    Arg(std::string text) : elems(ArgElem{std::move(text)}) {}
+    Arg(const fs::path& path) : elems(ArgElem{path.string()}) {}
+    Arg(temp_file token) : elems(ArgElem{std::move(token)}) {}
+    template <detail::argv_number I>
+    Arg(I n) : Arg(std::to_string(n)) {}
     template <class T> requires std::is_constructible_v<Arg, T>
-    Arg(in<T> t) : Arg(std::move(t.value)) { role_ = detail::Role::input; }
+    Arg(std::optional<T> v) { if (v) take(Arg(std::move(*v))); }
     template <class T> requires std::is_constructible_v<Arg, T>
-    Arg(out<T> t) : Arg(std::move(t.value)) { role_ = detail::Role::output; }
+    Arg(each<T> list) { for (auto& x : list.items) take(Arg(std::move(x))); }
+    template <detail::flag_text F, class V> requires std::is_constructible_v<Arg, V>
+    Arg(F flag, V value) {
+        for (ArgElem& e : Arg(std::move(value))) {
+            list().push_back(ArgElem{std::string(flag)});
+            list().push_back(std::move(e));
+        }
+    }
+    template <class T> requires std::is_constructible_v<Arg, T>
+    Arg(in<T> t) : Arg(std::move(t.value)) { mark(detail::Role::input); }
+    template <class T> requires std::is_constructible_v<Arg, T>
+    Arg(out<T> t) : Arg(std::move(t.value)) { mark(detail::Role::output); }
     // Placeholders belong to StageTemplate, which records instead of executing.
     Arg(slot) = delete;      ///< use shrn::StageTemplate for stages with slots
+    Arg(many) = delete;      ///< use shrn::StageTemplate for stages with lists
     Arg(optional) = delete;  ///< use shrn::StageTemplate for stages with optional groups
 
 private:
-    friend class Outcome;
-    friend class StageTemplate;
-    std::variant<std::string, temp_file> value_;
-    detail::Role role_ = detail::Role::none;
+    void mark(detail::Role r) { for (ArgElem& e : *this) e.role = r; }
 };
 
-// Placeholders (used by StageTemplate; declared here so rules can name them)
+// Placeholders (used by StageTemplate)
 
 /// A placeholder in a template, bound to a path at launch. A slot with
 /// a default is satisfied by the default when left unbound; one without is
@@ -882,35 +949,89 @@ class TArg;
 
 /// An argv fragment included whole when every slot inside it is bound (or
 /// defaulted), and dropped whole otherwise: `optional{"-2", slot{"r2"}}`.
+/// A pair with a slot value, `{"-2", slot{"r2"}}`, is the same thing.
 struct optional {
     std::vector<TArg> args;
     optional(std::initializer_list<TArg> a);
+    explicit optional(std::vector<TArg> a);
 };
 
-/// One template argv element: text, a temp token, a slot, a list, or an optional
-/// group, optionally tagged with in()/out().
-class TArg {
+/// One template argv element, with its freshness role.
+struct TArgElem {
+    /// `{"-l", many{"reads"}}`: the flag repeated before every bound item.
+    struct flagged_many {
+        std::string flag;
+        many list;
+    };
+    std::variant<std::string, temp_file, slot, many, std::shared_ptr<optional>, flagged_many> value;
+    detail::Role role = detail::Role::none;
+};
+
+/// Argv for a StageTemplate: everything Arg accepts, plus placeholders. A pair
+/// whose value is a slot drops when the slot is unbound; one whose value is a
+/// list repeats the flag per item.
+class TArg : public detail::elems<TArgElem> {
 public:
-    TArg(const char* text) : value_(std::string(text)) {}
-    TArg(std::string text) : value_(std::move(text)) {}
-    TArg(const fs::path& path) : value_(path.string()) {}
-    TArg(temp_file token) : value_(std::move(token)) {}
-    TArg(slot s) : value_(std::move(s)) {}
-    TArg(many m) : value_(std::move(m)) {}
-    TArg(optional group) : value_(std::make_shared<optional>(std::move(group))) {}
+    TArg(const char* text) : elems(TArgElem{std::string(text)}) {}
+    TArg(std::string text) : elems(TArgElem{std::move(text)}) {}
+    TArg(const fs::path& path) : elems(TArgElem{path.string()}) {}
+    TArg(temp_file token) : elems(TArgElem{std::move(token)}) {}
+    TArg(slot s) : elems(TArgElem{std::move(s)}) {}
+    TArg(many m) : elems(TArgElem{std::move(m)}) {}
+    TArg(optional group) : elems(TArgElem{std::make_shared<optional>(std::move(group))}) {}
+    template <detail::argv_number I>
+    TArg(I n) : TArg(std::to_string(n)) {}
     template <class T> requires std::is_constructible_v<TArg, T>
-    TArg(in<T> t) : TArg(std::move(t.value)) { role_ = detail::Role::input; }
+    TArg(std::optional<T> v) { if (v) take(TArg(std::move(*v))); }
     template <class T> requires std::is_constructible_v<TArg, T>
-    TArg(out<T> t) : TArg(std::move(t.value)) { role_ = detail::Role::output; }
+    TArg(each<T> list) { for (auto& x : list.items) take(TArg(std::move(x))); }
+    template <detail::flag_text F, class V> requires std::is_constructible_v<TArg, V>
+    TArg(F flag, V value) {
+        for (TArgElem& e : TArg(std::move(value))) pair(std::string(flag), std::move(e));
+    }
+    template <class T> requires std::is_constructible_v<TArg, T>
+    TArg(in<T> t) : TArg(std::move(t.value)) { mark(detail::Role::input); }
+    template <class T> requires std::is_constructible_v<TArg, T>
+    TArg(out<T> t) : TArg(std::move(t.value)) { mark(detail::Role::output); }
 
 private:
-    friend class Outcome;
     friend class StageTemplate;
-    std::variant<std::string, temp_file, slot, many, std::shared_ptr<optional>> value_;
-    detail::Role role_ = detail::Role::none;
+    explicit TArg(TArgElem e) : elems(std::move(e)) {}
+
+    /// Attach a flag to one value element, keeping the value's binding semantics.
+    void pair(std::string flag, TArgElem e) {
+        auto& out = list();
+        if (auto* s = std::get_if<slot>(&e.value)) {
+            // Unbound slot -> the whole pair disappears: an optional group.
+            std::vector<TArg> group;
+            group.push_back(TArg(TArgElem{std::move(flag)}));
+            group.push_back(TArg(TArgElem{std::move(*s), e.role}));
+            out.push_back(TArgElem{std::make_shared<optional>(std::move(group))});
+        } else if (auto* m = std::get_if<many>(&e.value)) {
+            out.push_back(TArgElem{TArgElem::flagged_many{std::move(flag), std::move(*m)}, e.role});
+        } else if (auto* g = std::get_if<std::shared_ptr<optional>>(&e.value)) {
+            std::vector<TArg> group;
+            group.push_back(TArg(TArgElem{std::move(flag)}));
+            for (TArg& inner : (*g)->args) group.push_back(std::move(inner));
+            out.push_back(TArgElem{std::make_shared<optional>(std::move(group))});
+        } else {
+            out.push_back(TArgElem{std::move(flag)});
+            out.push_back(std::move(e));
+        }
+    }
+    void mark(detail::Role r) {
+        for (TArgElem& e : *this) {
+            if (auto* g = std::get_if<std::shared_ptr<optional>>(&e.value)) {
+                for (TArg& inner : (*g)->args) inner.mark(r);
+            } else {
+                e.role = r;
+            }
+        }
+    }
 };
 
 inline optional::optional(std::initializer_list<TArg> a) : args(a) {}
+inline optional::optional(std::vector<TArg> a) : args(std::move(a)) {}
 
 // Freshness
 
@@ -973,9 +1094,12 @@ public:
         return std::move(proc(args, opts));
     }
 
-    /// Braced argument lists may mix text with temp_file tokens and in()/out() tags.
+    /// Braced argument lists: text, temp tokens, in()/out() tags, pairs, and splices.
     Outcome& proc(std::initializer_list<Arg> args, const RunOptions& opts = {}) & {
-        return proc_args(args.begin(), args.end(), opts);
+        if (!ok()) return *this;
+        std::vector<ArgElem> argv;
+        for (const Arg& a : args) argv.insert(argv.end(), a.begin(), a.end());
+        return proc_elems(argv.data(), argv.data() + argv.size(), opts);
     }
     Outcome&& proc(std::initializer_list<Arg> args, const RunOptions& opts = {}) && {
         return std::move(proc(args, opts));
@@ -1258,21 +1382,21 @@ private:
 
     /// Shared by the braced proc() and template replay: resolve tokens, gather
     /// tagged paths plus opts.inputs/outputs, then spawn unless fresh.
-    Outcome& proc_args(const Arg* first, const Arg* last, const RunOptions& opts) {
+    Outcome& proc_elems(const ArgElem* first, const ArgElem* last, const RunOptions& opts) {
         if (!ok()) return *this;
         std::vector<std::string> resolved;
         resolved.reserve(static_cast<std::size_t>(last - first));
         std::vector<fs::path> outputs = opts.outputs, inputs = opts.inputs;
-        for (const Arg* a = first; a != last; ++a) {
-            if (const auto* token = std::get_if<temp_file>(&a->value_)) {
+        for (const ArgElem* a = first; a != last; ++a) {
+            if (const auto* token = std::get_if<temp_file>(&a->value)) {
                 const fs::path* p = resolve(*token);
                 if (!p) return *this;  // resolve() recorded the failure
                 resolved.push_back(p->string());
             } else {
-                resolved.push_back(std::get<std::string>(a->value_));
+                resolved.push_back(std::get<std::string>(a->value));
             }
-            if (a->role_ == detail::Role::output) outputs.emplace_back(resolved.back());
-            else if (a->role_ == detail::Role::input) inputs.emplace_back(resolved.back());
+            if (a->role == detail::Role::output) outputs.emplace_back(resolved.back());
+            else if (a->role == detail::Role::input) inputs.emplace_back(resolved.back());
         }
         if (skip_fresh(outputs, inputs)) return *this;
         return start(resolved, opts);
@@ -1315,7 +1439,10 @@ private:
     decltype(auto) path_of(T& arg) {
         if constexpr (std::is_same_v<std::remove_cvref_t<T>, temp_file>) return static_cast<const fs::path&>(*resolve(arg));
         else if constexpr (detail::tagged<T>) return path_of(arg.value);
-        else return fs::path(arg);
+        else {
+            static_assert(std::is_constructible_v<fs::path, T&>, "call() arguments tagged in()/out() must be paths");
+            return fs::path(arg);
+        }
     }
     template <class T>
     void note_role(T& arg, std::vector<fs::path>& outputs, std::vector<fs::path>& inputs) {
@@ -1495,13 +1622,13 @@ public:
                     break;
                 case Step::file:
                 case Step::file_pred: {
-                    std::vector<Arg> targets;
+                    std::vector<ArgElem> targets;
                     append(s.args.front(), bound, targets);
-                    for (const Arg& t : targets) {
+                    for (const ArgElem& t : targets) {
                         const fs::path* p = nullptr;
                         fs::path text;
-                        if (const auto* tok = std::get_if<temp_file>(&t.value_)) p = out.resolve(*tok);
-                        else p = &(text = std::get<std::string>(t.value_));
+                        if (const auto* tok = std::get_if<temp_file>(&t.value)) p = out.resolve(*tok);
+                        else p = &(text = std::get<std::string>(t.value));
                         if (!p) break;  // resolve() recorded the failure
                         if (s.kind == Step::file) out.expect_file(*p);
                         else out.expect_file(*p, s.pred, s.text);
@@ -1509,7 +1636,7 @@ public:
                     break;
                 }
                 case Step::command: {
-                    std::vector<Arg> argv;
+                    std::vector<ArgElem> argv;
                     for (const auto& a : s.args) append(a, bound, argv);
                     RunOptions opts = s.opts;
                     if (s.stdout_target) {
@@ -1519,7 +1646,7 @@ public:
                             else opts.stdout_file = std::get<std::string>(*target);
                         }
                     }
-                    out.proc_args(argv.data(), argv.data() + argv.size(), opts);
+                    out.proc_elems(argv.data(), argv.data() + argv.size(), opts);
                     break;
                 }
                 case Step::function: {
@@ -1540,8 +1667,8 @@ public:
                         } else {
                             paths.emplace_back(std::get<std::string>(*v));
                         }
-                        if (a.role_ == detail::Role::output) outputs.push_back(paths.back());
-                        else if (a.role_ == detail::Role::input) inputs.push_back(paths.back());
+                        if (a.begin()->role == detail::Role::output) outputs.push_back(paths.back());
+                        else if (a.begin()->role == detail::Role::input) inputs.push_back(paths.back());
                     }
                     if (resolved && !out.skip_fresh(outputs, inputs)) out.call(s.fn, paths);
                     break;
@@ -1581,53 +1708,74 @@ private:
         if (s.stdout_target) collect(*s.stdout_target, out, true);
     }
     void collect(const TArg& a, std::unordered_map<std::string, Placeholder>& out, bool top) const {
-        if (const auto* s = std::get_if<slot>(&a.value_)) {
-            if (s->default_value) defaults_.emplace(s->name, *s->default_value);
-            auto& p = out[s->name];
-            p.required = p.required || top;
-        } else if (const auto* m = std::get_if<many>(&a.value_)) {
-            auto& p = out[m->name];
-            p.required = p.required || top;
-            p.list = true;
-        } else if (const auto* g = std::get_if<std::shared_ptr<optional>>(&a.value_)) {
-            for (const auto& inner : (*g)->args) collect(inner, out, false);
+        for (const TArgElem& e : a) {
+            if (const auto* s = std::get_if<slot>(&e.value)) {
+                if (s->default_value) defaults_.emplace(s->name, *s->default_value);
+                auto& p = out[s->name];
+                p.required = p.required || top;
+            } else if (const auto* m = std::get_if<many>(&e.value)) {
+                auto& p = out[m->name];
+                p.required = p.required || top;
+                p.list = true;
+            } else if (const auto* fm = std::get_if<TArgElem::flagged_many>(&e.value)) {
+                auto& p = out[fm->list.name];
+                p.required = p.required || top;
+                p.list = true;
+            } else if (const auto* g = std::get_if<std::shared_ptr<optional>>(&e.value)) {
+                for (const auto& inner : (*g)->args) collect(inner, out, false);
+            }
         }
     }
 
-    /// A scalar template argument as the concrete value it stands for.
+    /// A single-element template argument as the concrete value it stands for.
+    /// Pairs, lists, and splices are not scalars and yield nothing.
     std::optional<std::variant<std::string, temp_file>> lower(const TArg& a, const Bound& bound) const {
-        if (const auto* text = std::get_if<std::string>(&a.value_)) return *text;
-        if (const auto* t = std::get_if<temp_file>(&a.value_)) return *t;
-        if (const auto* s = std::get_if<slot>(&a.value_)) {
-            if (auto it = bound.find(s->name); it != bound.end()) {
-                if (const auto* str = std::get_if<std::string>(&it->second)) return *str;
-                if (const auto* tok = std::get_if<temp_file>(&it->second)) return *tok;
-            }
-            if (s->default_value) return *s->default_value;
-            return std::nullopt;  // only reachable inside an optional group
-        }
+        if (a.size() != 1) return std::nullopt;
+        const TArgElem& e = *a.begin();
+        if (const auto* text = std::get_if<std::string>(&e.value)) return *text;
+        if (const auto* t = std::get_if<temp_file>(&e.value)) return *t;
+        if (const auto* s = std::get_if<slot>(&e.value)) return lower(*s, bound);
         return std::nullopt;
+    }
+    std::optional<std::variant<std::string, temp_file>> lower(const slot& s, const Bound& bound) const {
+        if (auto it = bound.find(s.name); it != bound.end()) {
+            if (const auto* str = std::get_if<std::string>(&it->second)) return *str;
+            if (const auto* tok = std::get_if<temp_file>(&it->second)) return *tok;
+        }
+        if (s.default_value) return *s.default_value;
+        return std::nullopt;  // only reachable inside an optional group
     }
 
     /// Expand one template argument into argv. Lists expand in place; an optional
     /// group is dropped whole if any placeholder inside it is unbound.
-    bool append(const TArg& a, const Bound& bound, std::vector<Arg>& argv) const {
-        if (const auto* m = std::get_if<many>(&a.value_)) {
-            auto it = bound.find(m->name);
-            if (it == bound.end()) return false;
-            for (const auto& item : std::get<binding::list>(it->second)) argv.emplace_back(item).role_ = a.role_;
-            return true;
+    bool append(const TArg& a, const Bound& bound, std::vector<ArgElem>& argv) const {
+        for (const TArgElem& e : a) {
+            if (const auto* m = std::get_if<many>(&e.value)) {
+                auto it = bound.find(m->name);
+                if (it == bound.end()) return false;
+                for (const auto& item : std::get<binding::list>(it->second)) argv.push_back(ArgElem{item, e.role});
+            } else if (const auto* fm = std::get_if<TArgElem::flagged_many>(&e.value)) {
+                auto it = bound.find(fm->list.name);
+                if (it == bound.end()) return false;
+                for (const auto& item : std::get<binding::list>(it->second)) {
+                    argv.push_back(ArgElem{fm->flag});
+                    argv.push_back(ArgElem{item, e.role});
+                }
+            } else if (const auto* g = std::get_if<std::shared_ptr<optional>>(&e.value)) {
+                std::vector<ArgElem> group;
+                bool whole = true;
+                for (const auto& inner : (*g)->args)
+                    if (!append(inner, bound, group)) { whole = false; break; }  // unbound: drop the group, not an error
+                if (whole) argv.insert(argv.end(), std::move_iterator(group.begin()), std::move_iterator(group.end()));
+            } else {
+                std::optional<std::variant<std::string, temp_file>> v;
+                if (const auto* text = std::get_if<std::string>(&e.value)) v = *text;
+                else if (const auto* t = std::get_if<temp_file>(&e.value)) v = *t;
+                else v = lower(std::get<slot>(e.value), bound);
+                if (!v) return false;
+                std::visit([&](auto&& x) { argv.push_back(ArgElem{std::move(x), e.role}); }, std::move(*v));
+            }
         }
-        if (const auto* g = std::get_if<std::shared_ptr<optional>>(&a.value_)) {
-            std::vector<Arg> group;
-            for (const auto& inner : (*g)->args)
-                if (!append(inner, bound, group)) return true;  // unbound: drop the group, not an error
-            for (auto& x : group) argv.push_back(std::move(x));
-            return true;
-        }
-        auto v = lower(a, bound);
-        if (!v) return false;
-        std::visit([&](auto&& x) { argv.emplace_back(std::move(x)).role_ = a.role_; }, std::move(*v));
         return true;
     }
 
