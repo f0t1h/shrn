@@ -1306,6 +1306,22 @@ static void test_argv_shapes(const fs::path& dir) {
               lines() == "a.fq\nb.fq\n-l\na.fq\n-l\nb.fq\n",
           "each() splices in place; as a pair value it repeats the flag");
 
+    // Temp tokens resolve inside pairs, optionals, and each() like bare tokens.
+    {
+        std::optional<shrn::temp_file> no_tok, tok = shrn::temp_file{"b"};
+        const std::vector<shrn::temp_file> toks = {shrn::temp_file{"c"}, shrn::temp_file{"d"}};
+        auto s = shrn::stage("tokens");
+        s.proc({"printf", "%s\\n", {"-o", shrn::temp_file{"a"}}, {"-x", no_tok}, {"-y", tok}, {"-e", shrn::each(toks)}}, to_log).wait();
+        const fs::path* w = s.work_dir();
+        CHECK(s.ok() && w &&
+                  lines() == "-o\n" + (*w / "a").string() + "\n-y\n" + (*w / "b").string() + "\n-e\n" + (*w / "c").string() + "\n-e\n" + (*w / "d").string() + "\n",
+              "temp tokens inside pairs and each() resolve into the stage directory");
+        s.proc({"sh", "-c", "printf x > \"$2\"", "x", {"-o", shrn::out(shrn::temp_file{"w"})}}).wait();
+        bool ran = false;
+        s.call([&](const fs::path&) { ran = true; return 0; }, shrn::out(shrn::temp_file{"w"}));
+        CHECK(s.ok() && fs::exists(s.temp_path("w")) && !ran, "out() on a temp token inside a pair guards later steps");
+    }
+
     // Tags travel through pairs and drive freshness.
     const fs::path src = dir / "shape_in", dst = dir / "shape_out", marker = dir / "shape_ran";
     write_file(src, "x");
