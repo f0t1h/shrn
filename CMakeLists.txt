@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(shrn VERSION 0.11.0 LANGUAGES CXX)
+project(shrn VERSION 0.12.0 LANGUAGES CXX)
 
 include(GNUInstallDirs)
 

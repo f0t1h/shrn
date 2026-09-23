@@ -593,6 +593,16 @@ static void test_outcome(const fs::path& dir) {
     auto o3 = shrn::Outcome().expect_file(blank, shrn::file_non_empty, "non-empty");
     CHECK(!o3.ok() && o3.detail() == "not non-empty: " + blank.string(), "empty reported");
 
+    // expect_file takes the argv shapes: vectors check every element, optionals may be empty.
+    const std::vector<fs::path> both = {present, blank}, with_absent = {present, absent};
+    CHECK(shrn::Outcome().expect_file(both).ok(), "a vector of readable files passes");
+    CHECK(shrn::Outcome().expect_file(with_absent).detail() == "missing: " + absent.string(), "a vector reports its first missing element");
+    CHECK(shrn::Outcome().expect_file(both, shrn::file_non_empty, "non-empty").detail() == "not non-empty: " + blank.string(),
+          "a vector applies the predicate to every element");
+    CHECK(shrn::Outcome().expect_file(std::vector<fs::path>{}).ok(), "an empty vector checks nothing");
+    CHECK(shrn::Outcome().expect_file(std::optional<fs::path>{}).ok(), "an empty optional checks nothing");
+    CHECK(shrn::Outcome().expect_file(std::optional<fs::path>{absent}).detail() == "missing: " + absent.string(),
+          "a present optional is checked");
 
     auto is_fastq = [](const fs::path& p) { return std::ifstream(p).get() == '@'; };
     auto o5 = shrn::Outcome().expect_file(present, is_fastq, "FASTQ");

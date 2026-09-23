@@ -36,7 +36,8 @@ handle failures yourself, keep the `Outcome` and read `ok()`, `detail()`, and
 - `in(path)` / `out(path)` tags skip a command whose outputs are newer than its
   inputs, like `make`.
 - Argument lists accept `{flag, value}` pairs and `std::optional`, so a
-  conditional flag needs no `push_back`.
+  conditional flag needs no `push_back`; `expect_file` takes the same shapes
+  and a vector checks every file.
 - No exceptions, no output except from `or_die_if`. Failures are strings on the
   value. Builds with `-fno-exceptions`.
 
@@ -175,7 +176,7 @@ int main(int, char** argv) {
 include(FetchContent)
 FetchContent_Declare(shrn
     GIT_REPOSITORY https://github.com/f0t1h/shrn.git
-    GIT_TAG        v0.11.0)
+    GIT_TAG        v0.12.0)
 FetchContent_MakeAvailable(shrn)
 target_link_libraries(your_target PRIVATE shrn::shrn)
 ```

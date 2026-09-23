@@ -1248,43 +1248,49 @@ public:
         return std::move(expect(std::forward<Pred>(pred), detail));
     }
 
-    Outcome& expect_file(const fs::path& p) & {
-        if (!ok()) return *this;
-        if (!file_readable(p)) fail("missing: " + p.string());
+    /// Require readable regular files. The argument takes every shape proc()
+    /// accepts: a path, a temp token, a std::optional (nothing to check when
+    /// empty), or each(vector); every element it yields is checked in order.
+    Outcome& expect_file(const Arg& files) & {
+        for (const ArgElem& e : files) {
+            const fs::path* p = element_path(e);
+            if (!p) break;
+            if (!file_readable(*p)) { fail("missing: " + p->string()); break; }
+        }
         return *this;
     }
-    Outcome&& expect_file(const fs::path& p) && {
-        return std::move(expect_file(p));
-    }
-    Outcome& expect_file(temp_file token) & {
-        if (const fs::path* p = ok() ? resolve(token) : nullptr) expect_file(*p);
-        return *this;
-    }
-    Outcome&& expect_file(temp_file token) && { return std::move(expect_file(std::move(token))); }
+    Outcome&& expect_file(const Arg& files) && { return std::move(expect_file(files)); }
+    template <class T>
+    Outcome& expect_file(const std::vector<T>& files) & { return expect_file(each(files)); }
+    template <class T>
+    Outcome&& expect_file(const std::vector<T>& files) && { return std::move(expect_file(files)); }
 
+    /// As above, and every file must also satisfy `pred`; a failure reads `not <what>: <path>`.
     template <class Pred>
         requires std::is_invocable_r_v<bool, Pred, const fs::path&>
-    Outcome& expect_file(const fs::path& p, Pred&& pred, std::string_view what) & {
-        if (!ok()) return *this;
-        if (!file_readable(p)) fail("missing: " + p.string());
-        else if (!std::invoke(std::forward<Pred>(pred), p)) fail("not " + std::string(what) + ": " + p.string());
+    Outcome& expect_file(const Arg& files, Pred&& pred, std::string_view what) & {
+        for (const ArgElem& e : files) {
+            const fs::path* p = element_path(e);
+            if (!p) break;
+            if (!file_readable(*p)) { fail("missing: " + p->string()); break; }
+            if (!std::invoke(pred, *p)) { fail("not " + std::string(what) + ": " + p->string()); break; }
+        }
         return *this;
     }
     template <class Pred>
         requires std::is_invocable_r_v<bool, Pred, const fs::path&>
-    Outcome&& expect_file(const fs::path& p, Pred&& pred, std::string_view what) && {
-        return std::move(expect_file(p, std::forward<Pred>(pred), what));
+    Outcome&& expect_file(const Arg& files, Pred&& pred, std::string_view what) && {
+        return std::move(expect_file(files, std::forward<Pred>(pred), what));
     }
-    template <class Pred>
+    template <class T, class Pred>
         requires std::is_invocable_r_v<bool, Pred, const fs::path&>
-    Outcome& expect_file(temp_file token, Pred&& pred, std::string_view what) & {
-        if (const fs::path* p = ok() ? resolve(token) : nullptr) expect_file(*p, std::forward<Pred>(pred), what);
-        return *this;
+    Outcome& expect_file(const std::vector<T>& files, Pred&& pred, std::string_view what) & {
+        return expect_file(each(files), std::forward<Pred>(pred), what);
     }
-    template <class Pred>
+    template <class T, class Pred>
         requires std::is_invocable_r_v<bool, Pred, const fs::path&>
-    Outcome&& expect_file(temp_file token, Pred&& pred, std::string_view what) && {
-        return std::move(expect_file(std::move(token), std::forward<Pred>(pred), what));
+    Outcome&& expect_file(const std::vector<T>& files, Pred&& pred, std::string_view what) && {
+        return std::move(expect_file(files, std::forward<Pred>(pred), what));
     }
 
     template <class F>
@@ -1402,6 +1408,16 @@ private:
         return start(resolved, opts);
     }
 
+    /// The path an argv element stands for, or null once the stage has failed
+    /// (including a token that could not be resolved). Text is materialized
+    /// into `scratch_`, valid until the next call.
+    const fs::path* element_path(const ArgElem& e) {
+        if (!ok()) return nullptr;
+        if (const auto* tok = std::get_if<temp_file>(&e.value)) return resolve(*tok);
+        scratch_ = std::get<std::string>(e.value);
+        return &scratch_;
+    }
+
     /// Resolve a token to its path inside the stage temp directory, creating the
     /// directory on first use. Records a stage failure and returns null on error.
     const fs::path* resolve(const temp_file& token) {
@@ -1464,6 +1480,7 @@ private:
     mutable std::optional<Process> pending_;
     std::optional<detail::TempDir> temp_dir_;            ///< created on first temp_file use
     std::unordered_map<std::string, fs::path> temp_paths_;  ///< name -> resolved path
+    fs::path scratch_;                                       ///< element_path() result for text elements
 };
 
 /// Start a named stage.
